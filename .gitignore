@@ -52,3 +52,6 @@ third_parties/
 .vscode/
 datasets/
 examples/
+runs/
+samples/
+*validation/
