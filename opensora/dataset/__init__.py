@@ -27,7 +27,7 @@ def getdataset(args):
             norm_fun
         ])
         # tokenizer = AutoTokenizer.from_pretrained("/storage/ongoing/new/Open-Sora-Plan/cache_dir/mt5-xxl", cache_dir=args.cache_dir)
-        tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_name, cache_dir=args.cache_dir)
+        tokenizer = AutoTokenizer.from_pretrained('mt5-xxl')
         return T2V_dataset(args, transform=transform, temporal_sample=temporal_sample, tokenizer=tokenizer, 
                            transform_topcrop=transform_topcrop)
     raise NotImplementedError(args.dataset)

@@ -12,6 +12,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNormSingle
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 from opensora.models.diffusion.opensora.modules import OverlapPatchEmbed3D, OverlapPatchEmbed2D, PatchEmbed2D, BasicTransformerBlock
+from opensora.models.encs.PoseGuider import PoseGuider
 from opensora.utils.utils import to_2tuple
 try:
     import torch_npu
@@ -55,6 +56,7 @@ class OpenSoraT2V(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
+        # args=None,  # TypeError: Object of type Namespace is not JSON serializable
         num_attention_heads: int = 16,
         attention_head_dim: int = 88,
         in_channels: Optional[int] = None,
@@ -88,6 +90,8 @@ class OpenSoraT2V(ModelMixin, ConfigMixin):
         downsampler: str = None, 
         use_rope: bool = False,
         use_stable_fp32: bool = False,
+
+        latent_pose=None,
     ):
         super().__init__()
 
@@ -103,6 +107,7 @@ class OpenSoraT2V(ModelMixin, ConfigMixin):
                 )
 
         # Set some common variables used across the board.
+        self.latent_pose = latent_pose
         self.use_rope = use_rope
         self.use_linear_projection = use_linear_projection
         self.interpolation_scale_t = interpolation_scale_t
@@ -143,6 +148,8 @@ class OpenSoraT2V(ModelMixin, ConfigMixin):
         # 2. Initialize the right blocks.
         # Initialize the output blocks and other projection blocks when necessary.
         self._init_patched_inputs(norm_type=norm_type)
+
+        self._create_latent_pose()
 
     def _init_patched_inputs(self, norm_type):
         assert self.config.sample_size_t is not None, "OpenSoraT2V over patched input must provide sample_size_t"
@@ -272,6 +279,12 @@ class OpenSoraT2V(ModelMixin, ConfigMixin):
                 in_features=self.caption_channels, hidden_size=self.inner_dim
             )
 
+    def _create_latent_pose(self):
+        if self.latent_pose == 'aa':
+            self.enc_pose = PoseGuider()
+        elif self.latent_pose != 'none':
+            raise ValueError
+    
     def _set_gradient_checkpointing(self, module, value=False):
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
@@ -287,6 +300,8 @@ class OpenSoraT2V(ModelMixin, ConfigMixin):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_image_num: Optional[int] = 0,
+        
+        data=None,
         return_dict: bool = True,
     ):
         """
@@ -413,6 +428,9 @@ class OpenSoraT2V(ModelMixin, ConfigMixin):
         frame = ((frame - 1) // self.patch_size_t + 1) if frame % 2 == 1 else frame // self.patch_size_t  # patchfy
         # print('frame', frame)
         height, width = hidden_states.shape[-2] // self.patch_size, hidden_states.shape[-1] // self.patch_size
+
+        if self.latent_pose == 'aa':
+            hidden_states = hidden_states + self.enc_pose(data['kpmaps'])  #TODO: pre-process?
 
         added_cond_kwargs = {"resolution": None, "aspect_ratio": None}
         hidden_states_vid, hidden_states_img, encoder_hidden_states_vid, encoder_hidden_states_img, \

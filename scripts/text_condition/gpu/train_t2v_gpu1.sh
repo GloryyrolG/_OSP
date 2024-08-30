@@ -1,24 +1,4 @@
-# export WANDB_MODE="offline"
-export ENTITY="linbin"
-export HF_DATASETS_OFFLINE=1 
-export TRANSFORMERS_OFFLINE=1
-export PDSH_RCMD_TYPE=ssh
-# NCCL setting
-export GLOO_SOCKET_IFNAME=eth0  # bond0
-export NCCL_SOCKET_IFNAME=eth0  # bond0
-export NCCL_IB_HCA=mlx5_10:1,mlx5_11:1,mlx5_12:1,mlx5_13:1
-export NCCL_IB_GID_INDEX=3
-export NCCL_IB_TC=162
-export NCCL_IB_TIMEOUT=22
-export NCCL_PXN_DISABLE=0
-export NCCL_IB_QPS_PER_CONNECTION=4
-export NCCL_ALGO=Ring
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-# export NCCL_ALGO=Tree
-
-accelerate launch \
-    --config_file scripts/accelerate_configs/deepspeed_zero2_config.yaml \
+python \
     opensora/train/train_t2v_diffusers.py \
     --model OpenSoraT2V-ROPE-L/122 \
     --text_encoder_name google/mt5-xxl \
@@ -61,10 +41,11 @@ accelerate launch \
     --speed_factor 1.0 \
     --group_frame \
     --sp_size 1 \
-    --train_sp_batch_size 2 \
+    --train_sp_batch_size 1 \
+    --output_dir="exps/motionxpp_ft-1" \
     --enable_tracker \
     --guidance_scale 2.5 \
-    --pretrained ospv120/29x480p/diffusion_pytorch_model.safetensors \
-    --output_dir="exps/motionxpp_mc" \
-    --latent_pose aa \
-    # --resume_from_checkpoint="latest" \
+    --pretrained exps/motionxpp_ft/checkpoint-15000/model_ema/diffusion_pytorch_model.safetensors \
+
+# --latent_pose aa \
+# --resume_from_checkpoint="latest" \

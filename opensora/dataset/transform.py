@@ -1,7 +1,9 @@
+import numpy as np
 import torch
 import random
 import numbers
 from torchvision.transforms import RandomCrop, RandomResizedCrop
+from third_parties.open_animateanyone.DWPose.dwpose_utils.util import draw_bodypose
 
 
 def _is_tensor_video_clip(clip):
@@ -536,6 +538,41 @@ class DynamicSampleDuration(object):
         if self.extra_1:
             truncate_t = truncate_t + 1
         return 0, truncate_t
+
+
+# joints_name = ('nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',    # 4
+#                'left_shoulder', 'right_shoulder',                           # 6
+#                'left_elbow', 'right_elbow',                                 # 8
+#                'left_wrist', 'right_wrist',                                 # 10
+#                'left_hip', 'right_hip',                                     # 12
+#                'left_knee', 'right_knee',                                   # 14
+#                'left_ankle', 'right_ankle')                                 # 16
+
+def get_kpmaps(kp17_2ds, h, w):
+    T = kp17_2ds.shape[0]
+    kpmaps = np.zeros((T, h, w, 3), dtype=np.uint8)
+    kpmap17_to_18 = [0, 15, 14, 17, 16,
+                     5, 2,
+                     6, 3,
+                     7, 4,
+                     11, 8,
+                     12, 9,
+                     13, 10]  # COCO to OP
+    kpmap17_to_18 = np.array(kpmap17_to_18)
+
+    kp18_2ds = np.zeros((T, 18, 2), dtype=np.float32)
+    kp18_2ds[:, kpmap17_to_18] = kp17_2ds[..., : 2]
+    kp18_2ds[:, 1] = (kp18_2ds[:, 5] + kp18_2ds[:, 2]) / 2  # neck
+    norm_kp18_2ds = kp18_2ds / np.array([w, h])
+
+    for t in range(T):
+        subset = np.arange(18)[None]  # single-person
+        miss_kps = np.nonzero(kp17_2ds[t, :, -1].numpy() == 0)[0]
+        subset[:, kpmap17_to_18[miss_kps]] = -1
+
+        kpmaps[t] = draw_bodypose(kpmaps[t], norm_kp18_2ds[t], subset)
+    return torch.from_numpy(kpmaps).permute(0, 3, 1, 2)
+
 
 if __name__ == '__main__':
     from torchvision import transforms

@@ -44,3 +44,11 @@ hw*
 taming*
 221hw*
 65x512x512
+ospv120/
+mt5-xxl/
+tmp/
+exps/
+third_parties/
+.vscode/
+datasets/
+examples/

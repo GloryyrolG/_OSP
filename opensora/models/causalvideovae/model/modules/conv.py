@@ -46,7 +46,6 @@ class Conv2d(nn.Conv2d):
     @video_to_image
     def forward(self, x):
         return super().forward(x)
-        
 
 
 class CausalConv3d(nn.Module):

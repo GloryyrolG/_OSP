@@ -1,4 +1,6 @@
 import math
+import sys
+sys.path.append('/mnt/data/rongyu/projects/Open-Sora-Plan/')
 import os
 import torch
 import argparse
@@ -66,8 +68,8 @@ def main(args):
         transformer_model = LatteT2V.from_pretrained(args.model_path, cache_dir=args.cache_dir, low_cpu_mem_usage=False, 
                                                      device_map=None, torch_dtype=weight_dtype)
         
-    text_encoder = MT5EncoderModel.from_pretrained(args.text_encoder_name, cache_dir=args.cache_dir, low_cpu_mem_usage=True, torch_dtype=weight_dtype)
-    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_name, cache_dir=args.cache_dir)
+    text_encoder = MT5EncoderModel.from_pretrained('mt5-xxl', low_cpu_mem_usage=True, torch_dtype=weight_dtype)
+    tokenizer = AutoTokenizer.from_pretrained('mt5-xxl')
     # text_encoder = MT5EncoderModel.from_pretrained("/storage/ongoing/new/Open-Sora-Plan/cache_dir/mt5-xxl", cache_dir=args.cache_dir, low_cpu_mem_usage=True, torch_dtype=weight_dtype)
     # tokenizer = AutoTokenizer.from_pretrained("/storage/ongoing/new/Open-Sora-Plan/cache_dir/mt5-xxl", cache_dir=args.cache_dir)
     
@@ -174,6 +176,7 @@ def main(args):
                           width=args.width,
                           num_inference_steps=args.num_sampling_steps,
                           guidance_scale=args.guidance_scale,
+                        #   enable_temporal_attentions=True,
                           num_images_per_prompt=1,
                           mask_feature=True,
                           device=args.device, 

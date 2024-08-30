@@ -7,6 +7,7 @@
 """
 A minimal training script for DiT using PyTorch DDP.
 """
+import sys; sys.path.append('/mnt/data/rongyu/projects/Open-Sora-Plan/')
 import argparse
 import logging
 import math
@@ -49,7 +50,7 @@ from packaging import version
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMScheduler, PNDMScheduler, DPMSolverMultistepScheduler
+from diffusers import DDPMScheduler, PNDMScheduler, DPMSolverMultistepScheduler, EulerAncestralDiscreteScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import check_min_version, is_wandb_available
@@ -75,18 +76,25 @@ def log_validation(args, model, vae, text_encoder, tokenizer, accelerator, weigh
     negative_prompt = """nsfw, lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, 
                         """
     validation_prompt = [
-        "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about.",
-        "A serene underwater scene featuring a sea turtle swimming through a coral reef. The turtle, with its greenish-brown shell, is the main focus of the video, swimming gracefully towards the right side of the frame. The coral reef, teeming with life, is visible in the background, providing a vibrant and colorful backdrop to the turtle's journey. Several small fish, darting around the turtle, add a sense of movement and dynamism to the scene."
+        "A man is doing a jumpy dance",
+        # "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about.",
+        # "A serene underwater scene featuring a sea turtle swimming through a coral reef. The turtle, with its greenish-brown shell, is the main focus of the video, swimming gracefully towards the right side of the frame. The coral reef, teeming with life, is visible in the background, providing a vibrant and colorful backdrop to the turtle's journey. Several small fish, darting around the turtle, add a sense of movement and dynamism to the scene."
         ]
     if 'mt5' in args.text_encoder_name:
         validation_prompt_cn = [
-            "一只戴着墨镜在泳池当救生员的猫咪。",
-            "这是一个宁静的水下场景，一只海龟游过珊瑚礁。海龟带着绿褐色的龟壳，优雅地游向画面右侧，成为视频的焦点。背景中的珊瑚礁生机盎然，为海龟的旅程提供了生动多彩的背景。几条小鱼在海龟周围穿梭，为画面增添了动感和活力。"
+            # "一只戴着墨镜在泳池当救生员的猫咪。",
+            # "这是一个宁静的水下场景，一只海龟游过珊瑚礁。海龟带着绿褐色的龟壳，优雅地游向画面右侧，成为视频的焦点。背景中的珊瑚礁生机盎然，为海龟的旅程提供了生动多彩的背景。几条小鱼在海龟周围穿梭，为画面增添了动感和活力。"
             ]
         validation_prompt += validation_prompt_cn
+    
+    data = {}
+    data['kpmaps'] = torch.from_numpy(np.load('datasets/motionxpp/11742.npy', mmap_mode='r')
+                                      ).to(device=accelerator.device, dtype=weight_dtype)
+
     logger.info(f"Running validation....\n")
     model = accelerator.unwrap_model(model)
-    scheduler = DPMSolverMultistepScheduler()
+    # scheduler = DPMSolverMultistepScheduler()
+    scheduler = EulerAncestralDiscreteScheduler()
     opensora_pipeline = OpenSoraPipeline(vae=vae,
                                          text_encoder=text_encoder,
                                          tokenizer=tokenizer,
@@ -103,11 +111,12 @@ def log_validation(args, model, vae, text_encoder, tokenizer, accelerator, weigh
                                 width=args.max_width,
                                 num_inference_steps=args.num_sampling_steps,
                                 guidance_scale=args.guidance_scale,
-                                enable_temporal_attentions=True,
+                                # enable_temporal_attentions=True,
                                 num_images_per_prompt=1,
                                 mask_feature=True,
                                 max_sequence_length=args.model_max_length,
-                                ).images
+                                data=data,
+                                ).images  #TODO: eval
         videos.append(video[0])
     # import ipdb;ipdb.set_trace()
     gc.collect()
@@ -274,7 +283,8 @@ def main(args):
         # compress_kv_factor=args.compress_kv_factor,
         use_rope=args.use_rope,
         # model_max_length=args.model_max_length,
-        use_stable_fp32=args.enable_stable_fp32, 
+        use_stable_fp32=args.enable_stable_fp32,
+        latent_pose=getattr(args, 'latent_pose', 'none'),
     )
     model.gradient_checkpointing = args.gradient_checkpointing
 
@@ -485,7 +495,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers(os.path.basename(args.output_dir), config=vars(args))
+        accelerator.init_trackers('debug' if 'debug' in args.output_dir else 'osp', config=vars(args))  # os.path.basename(args.output_dir)
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -689,8 +699,8 @@ def main(args):
             if progress_info.global_step % args.checkpointing_steps == 0:
 
                 if args.enable_tracker:
-                    log_validation(args, model, ae, text_enc.text_enc, train_dataset.tokenizer, accelerator,
-                                   weight_dtype, progress_info.global_step)
+                    # log_validation(args, model, ae, text_enc.text_enc, train_dataset.tokenizer, accelerator,
+                    #                weight_dtype, progress_info.global_step)
 
                     if args.use_ema and npu_config is None:
                         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
@@ -708,8 +718,8 @@ def main(args):
         return loss
 
     def train_one_step(step_, data_item_, prof_=None):
-        train_loss = 0.0
-        x, attn_mask, input_ids, cond_mask = data_item_
+        train_loss = 0.0  # train_dataset is not defined?
+        x, attn_mask, input_ids, cond_mask, _, _1 = data_item_
         if args.group_frame or args.group_resolution:
             if not args.group_frame:
                 each_latent_frame = torch.any(attn_mask.flatten(-2), dim=-1).int().sum(-1).tolist()
@@ -734,7 +744,7 @@ def main(args):
             cond = text_enc(input_ids_, cond_mask_)  # B 1+num_images L D
             cond = cond.reshape(B, N, L, -1)
             # Map input images to latent space + normalize latents
-            x = ae.encode(x)  # B C T H W
+            x = ae.encode(x)  # B C T H W, e.g., 1, 4, 8, 60, 80
 
             # def custom_to_video(x: torch.Tensor, fps: float = 2.0, output_file: str = 'output_video.mp4') -> None:
             #     from examples.rec_video import array_to_video
@@ -757,6 +767,7 @@ def main(args):
             else:
                 set_sequence_parallel_state(True)
         if get_sequence_parallel_state():
+            raise NotImplementedError
             x, cond, attn_mask, cond_mask, use_image_num = prepare_parallel_data(x, cond, attn_mask, cond_mask,
                                                                                  args.use_image_num)
             for iter in range(args.train_batch_size * args.sp_size // args.train_sp_batch_size):
@@ -772,8 +783,12 @@ def main(args):
             with accelerator.accumulate(model):
                 assert not torch.any(torch.isnan(x)), 'after vae'
                 x = x.to(weight_dtype)
+                keys = ['pixel_values', 'attn_msk', 'input_ids', 'cond_mask', 'kpmaps', 'vid_pth']
+                data = dict(zip(keys, data_item_))
+                data = {k: v.to(weight_dtype) for k, v in data.items() if isinstance(v, torch.Tensor)}
                 model_kwargs = dict(encoder_hidden_states=cond, attention_mask=attn_mask,
-                                    encoder_attention_mask=cond_mask, use_image_num=args.use_image_num)
+                                    encoder_attention_mask=cond_mask, use_image_num=args.use_image_num,
+                                    data=data)
                 run(x, model_kwargs, prof_)
 
         set_sequence_parallel_state(current_step_sp_state)  # in case the next step use sp, which need broadcast(timesteps)
@@ -784,7 +799,7 @@ def main(args):
         return False
 
     def train_all_epoch(prof_=None):
-        for epoch in range(first_epoch, args.num_train_epochs):
+        for epoch in range(first_epoch, args.num_train_epochs):  # model not defined?
             progress_info.train_loss = 0.0
             if progress_info.global_step >= args.max_train_steps:
                 return True
@@ -853,6 +868,7 @@ if __name__ == "__main__":
     parser.add_argument("--compress_kv", action="store_true")
     parser.add_argument("--attention_mode", type=str, choices=['xformers', 'math', 'flash'], default="xformers")
     parser.add_argument('--use_rope', action='store_true')
+    parser.add_argument('--latent_pose', default='none', type=str)
     parser.add_argument('--compress_kv_factor', type=int, default=1)
     parser.add_argument('--interpolation_scale_h', type=float, default=1.0)
     parser.add_argument('--interpolation_scale_w', type=float, default=1.0)

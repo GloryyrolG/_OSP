@@ -25,6 +25,7 @@ from tqdm import tqdm
 from PIL import Image
 from accelerate.logging import get_logger
 
+from opensora.dataset.transform import CenterCropResizeVideo, get_kpmaps
 from opensora.utils.dataset_utils import DecordInit
 from opensora.utils.utils import text_preprocessing
 logger = get_logger(__name__)
@@ -162,10 +163,13 @@ class T2V_dataset(Dataset):
 
     def __getitem__(self, idx):
         try:
+            # idx = 11742
+            # import warnings; warnings.warn(f"{'>>>' * 10} Debug 11742!")
+        # if True:
             data = self.get_data(idx)
             return data
         except Exception as e:
-            logger.info(f'Error with {e}')
+            logger.info(f'Error with {idx}: {e}')
             # 打印异常堆栈
             if idx in dataset_prog.cap_list:
                 logger.info(f"Caught an exception! {dataset_prog.cap_list[idx]}")
@@ -180,6 +184,37 @@ class T2V_dataset(Dataset):
         else:
             return self.get_image(idx)
     
+    def tsfm_kp2ds(self, kp2ds, hw):
+        kp2ds = kp2ds.clone()
+        wh = hw.flip([0])
+        for tsfm in self.transform.transforms:
+            if isinstance(tsfm, CenterCropResizeVideo):
+                tsfm_wh = torch.tensor(tsfm.size[:: -1])
+                scale = (wh / (hw / tsfm_wh.flip([0]) * tsfm_wh)).clip(min=1)
+                kp2ds[..., : 2] = ((kp2ds[..., : 2] / wh - 0.5) * scale + 0.5) * tsfm_wh
+                conf = kp2ds[..., -1] > 0
+                kp2ds[~conf] = 0
+        return kp2ds
+
+    def get_kp2ds(self, idx, sample_frame_ids):
+        kp2ds = torch.zeros(len(sample_frame_ids), 17, 3, dtype=torch.float32)
+        keypoints_path = dataset_prog.cap_list[idx]['kp2d_pth']
+        with open(keypoints_path, 'r') as file:
+            annots = json.load(file)
+        # dtype
+        annot_frame_ids = {int(annot['file_name'].split('/')[-1][: -4]) - 1: annot['body_kpts']
+                           for annot in annots['annotations']}
+        zero_l = [[0, 0, 0]] * 17
+        kp2ds = torch.tensor([annot_frame_ids.get(idx, zero_l)
+                              for idx in sample_frame_ids])  # almost nonzero ratio >= 0.5
+        assert torch.all((kp2ds[..., -1] - 0.5).abs() == 0.5)
+        h, w = (dataset_prog.cap_list[idx]['resolution']['height'],
+                dataset_prog.cap_list[idx]['resolution']['width'])  # orig
+        hw = torch.tensor([h, w])
+        # tsfm_kp2ds = self.tsfm_kp2ds(kp2ds, hw)
+        kp2ds_orig = kp2ds
+        return kp2ds_orig
+    
     def get_video(self, idx):
         # npu_config.print_msg(f"current idx is {idx}")
         # video = random.choice([random_video_noise(65, 3, 336, 448), random_video_noise(65, 3, 1024, 1024), random_video_noise(65, 3, 360, 480)])
@@ -190,17 +225,24 @@ class T2V_dataset(Dataset):
         video_path = dataset_prog.cap_list[idx]['path']
         assert os.path.exists(video_path), f"file {video_path} do not exist!"
         frame_indice = dataset_prog.cap_list[idx]['sample_frame_index']
-        video = self.decord_read(video_path, predefine_num_frames=len(frame_indice))
+        video, sample_frame_ids = self.decord_read(video_path, predefine_num_frames=len(frame_indice))
 
         h, w = video.shape[-2:]
         assert h / w <= 17 / 16 and h / w >= 8 / 16, f'Only videos with a ratio (h/w) less than 17/16 and more than 8/16 are supported. But video ({video_path}) found ratio is {round(h / w, 2)} with the shape of {video.shape}'
         t = video.shape[0]
-        video = self.transform(video)  # T C H W -> T C H W
+        video_orig = video
+        video = self.transform(video_orig)  # T C H W -> T C H W
 
         # video = torch.rand(221, 3, 480, 640)
 
         video = video.transpose(0, 1)  # T C H W -> C T H W
-        text = dataset_prog.cap_list[idx]['cap']
+
+        if '/motion' in video_path.lower():
+            import warnings; warnings.warn(f"{'>>>' * 10} Act as text!")
+            text = ' '.join(video_path.split('/')[-1].split('_')[: -1]).replace(' +', ',').lower()
+        else:
+            text = dataset_prog.cap_list[idx]['cap']
+        
         if not isinstance(text, list):
             text = [text]
         text = [random.choice(text)]
@@ -217,7 +259,16 @@ class T2V_dataset(Dataset):
         )
         input_ids = text_tokens_and_mask['input_ids']
         cond_mask = text_tokens_and_mask['attention_mask']
-        return dict(pixel_values=video, input_ids=input_ids, cond_mask=cond_mask)
+
+        # Other data
+        kp2ds_orig = self.get_kp2ds(idx, sample_frame_ids)
+        h_orig, w_orig = (dataset_prog.cap_list[idx]['resolution']['height'],
+                          dataset_prog.cap_list[idx]['resolution']['width'])  # orig
+        kpmaps_orig = get_kpmaps(kp2ds_orig, h_orig, w_orig)
+        assert kpmaps_orig.shape == video_orig.shape
+        kpmaps = self.transform(kpmaps_orig).transpose(0, 1)
+
+        return dict(pixel_values=video, input_ids=input_ids, cond_mask=cond_mask, kpmaps=kpmaps, vid_pth=video_path)
 
     def get_image(self, idx):
         image_data = dataset_prog.cap_list[idx]  # [{'path': path, 'cap': cap}, ...]
@@ -294,7 +345,7 @@ class T2V_dataset(Dataset):
                                                 min_h_div_w_ratio=1/hw_aspect_thr*aspect)
                     if not is_pick:
                         cnt_resolution_mismatch += 1
-                        continue
+                        continue  # bookmark
 
                     # # ignore image resolution mismatch
                     # if self.max_height > resolution['height'] or self.max_width > resolution['width']:
@@ -303,10 +354,13 @@ class T2V_dataset(Dataset):
 
                 # import ipdb;ipdb.set_trace()
                 i['num_frames'] = int(fps * duration)
+
                 # max 5.0 and min 1.0 are just thresholds to filter some videos which have suitable duration. 
-                if i['num_frames'] > 2.0 * (self.num_frames * fps / self.train_fps * self.speed_factor):  # too long video is not suitable for this training stage (self.num_frames)
-                    cnt_too_long += 1
-                    continue
+                # if i['num_frames'] > 2.0 * (self.num_frames * fps / self.train_fps * self.speed_factor):  # too long video is not suitable for this training stage (self.num_frames)
+                #     cnt_too_long += 1
+                #     continue
+                import warnings; warnings.warn(f"{'>>>' * 10} No long filter!")
+                
                 # if i['num_frames'] < 1.0/1 * (self.num_frames * fps / self.train_fps * self.speed_factor):  # too short video is not suitable for this training stage
                 #     cnt_too_short += 1
                 #     continue 
@@ -352,7 +406,7 @@ class T2V_dataset(Dataset):
                 f'before filter: {len(cap_list)}, after filter: {len(new_cap_list)}')
         return new_cap_list, sample_num_frames
     
-    def decord_read(self, path, predefine_num_frames):
+    def decord_read(self, path, predefine_num_frames):  # core
         decord_vr = self.v_decoder(path)
         total_frames = len(decord_vr)
         fps = decord_vr.get_avg_fps() if decord_vr.get_avg_fps() > 0 else 30.0
@@ -366,11 +420,16 @@ class T2V_dataset(Dataset):
         # speed up
         max_speed_factor = len(frame_indices) / self.num_frames
         if self.speed_factor > 1 and max_speed_factor > 1:
+            raise NotImplementedError
             # speed_factor = random.uniform(1.0, min(self.speed_factor, max_speed_factor))
             speed_factor = min(self.speed_factor, max_speed_factor)
             target_frame_count = int(len(frame_indices) / speed_factor)
             speed_frame_idx = np.linspace(0, len(frame_indices) - 1, target_frame_count, dtype=int)
             frame_indices = frame_indices[speed_frame_idx]
+        
+        if 'webvid' in path.lower():
+            import warnings; warnings.warn(f"{'>>>' * 10} Downsample!")
+            frame_indices = np.linspace(0, total_frames - 1, int(total_frames / fps * 8)).astype(int)  # fps=8
 
         #  too long video will be temporal-crop randomly
         if len(frame_indices) > self.num_frames:
@@ -390,7 +449,7 @@ class T2V_dataset(Dataset):
         video_data = decord_vr.get_batch(frame_indices).asnumpy()
         video_data = torch.from_numpy(video_data)
         video_data = video_data.permute(0, 3, 1, 2)  # (T, H, W, C) -> (T C H W)
-        return video_data
+        return video_data, frame_indices
 
     def read_jsons(self, data):
         cap_lists = []
@@ -402,6 +461,8 @@ class T2V_dataset(Dataset):
             logger.info(f'Building {anno}...')
             for i in range(len(sub_list)):
                 sub_list[i]['path'] = opj(folder, sub_list[i]['path'])
+                if 'kp2d_pth' in sub_list[i]:
+                    sub_list[i]['kp2d_pth'] = opj(folder, sub_list[i]['kp2d_pth'])
             cap_lists += sub_list
         return cap_lists
 

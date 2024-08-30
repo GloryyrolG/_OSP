@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import html
 import inspect
 import re
@@ -734,6 +735,13 @@ class OpenSoraPipeline(DiffusionPipeline):
         # 7. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
+        data = kwargs.get('data', None)
+        if data is not None:
+            data = copy.deepcopy(data)
+        if self.transformer.latent_pose == 'aa':
+            if do_classifier_free_guidance:
+                data['kpmaps'] = torch.cat([data['kpmaps']] * 2)
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
@@ -770,6 +778,8 @@ class OpenSoraPipeline(DiffusionPipeline):
                     encoder_attention_mask=prompt_attention_mask,
                     timestep=current_timestep,
                     added_cond_kwargs=added_cond_kwargs,
+                    
+                    data=data,
                     return_dict=False,
                 )[0]
 

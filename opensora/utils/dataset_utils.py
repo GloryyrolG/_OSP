@@ -74,20 +74,23 @@ class Collate:
         batch_tubes = [i['pixel_values'] for i in batch]  # b [c t h w]
         input_ids = [i['input_ids'] for i in batch]  # b [1 l]
         cond_mask = [i['cond_mask'] for i in batch]  # b [1 l]
-        return batch_tubes, input_ids, cond_mask
+        
+        kpmaps = [i['kpmaps'] for i in batch]
+        vid_pth = [i['vid_pth'] for i in batch]
+        return batch_tubes, input_ids, cond_mask, kpmaps, vid_pth
 
     def __call__(self, batch):
-        batch_tubes, input_ids, cond_mask = self.package(batch)
+        batch_tubes, input_ids, cond_mask, kpmaps, vid_pth = self.package(batch)
 
         ds_stride = self.ae_stride * self.patch_size
         t_ds_stride = self.ae_stride_t * self.patch_size_t
         
-        pad_batch_tubes, attention_mask, input_ids, cond_mask = self.process(batch_tubes, input_ids, cond_mask, t_ds_stride, ds_stride, self.max_thw, self.ae_stride_thw)
+        pad_batch_tubes, attention_mask, input_ids, cond_mask, kpmaps = self.process(batch_tubes, input_ids, cond_mask, kpmaps, t_ds_stride, ds_stride, self.max_thw, self.ae_stride_thw)
         assert not torch.any(torch.isnan(pad_batch_tubes)), 'after pad_batch_tubes'
-        return pad_batch_tubes, attention_mask, input_ids, cond_mask
+        return pad_batch_tubes, attention_mask, input_ids, cond_mask, kpmaps, vid_pth
 
 
-    def process(self, batch_tubes, input_ids, cond_mask, t_ds_stride, ds_stride, max_thw, ae_stride_thw):
+    def process(self, batch_tubes, input_ids, cond_mask, kpmaps, t_ds_stride, ds_stride, max_thw, ae_stride_thw):
         # pad to max multiple of ds_stride
         batch_input_size = [i.shape for i in batch_tubes]  # [(c t h w), (c t h w)]
         assert len(batch_input_size) == self.batch_size
@@ -96,6 +99,7 @@ class Collate:
             idx_length_dict = dict([*zip(list(range(self.batch_size)), len_each_batch)])
             count_dict = Counter(len_each_batch)
             if len(count_dict) != 1:
+                raise NotImplementedError
                 sorted_by_value = sorted(count_dict.items(), key=lambda item: item[1])
                 # import ipdb;ipdb.set_trace()
                 # print(batch, idx_length_dict, count_dict, sorted_by_value)
@@ -134,6 +138,8 @@ class Collate:
             ]
         pad_batch_tubes = torch.stack(pad_batch_tubes, dim=0)
 
+        assert each_pad_t_h_w == [[0, 0, 0]]
+        pad_kpmaps = torch.stack(kpmaps, dim=0)
 
         max_tube_size = [pad_max_t, pad_max_h, pad_max_w]
         max_latent_size = [
@@ -158,7 +164,7 @@ class Collate:
         input_ids = torch.stack(input_ids)  # b 1 l
         cond_mask = torch.stack(cond_mask)  # b 1 l
 
-        return pad_batch_tubes, attention_mask, input_ids, cond_mask
+        return pad_batch_tubes, attention_mask, input_ids, cond_mask, pad_kpmaps
 
  
 def split_to_even_chunks(indices, lengths, num_chunks, batch_size):

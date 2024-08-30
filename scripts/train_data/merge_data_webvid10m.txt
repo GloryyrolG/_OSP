@@ -1,0 +1,1 @@
+/mnt/workspace/workgroup/tanfeng/data/virgo_videos/Webvid-10M/,/mnt/data/rongyu/projects/Open-Sora-Plan/datasets/webvid10m/webvid10_motion_human.json
