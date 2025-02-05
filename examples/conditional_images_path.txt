@@ -1,2 +1,4 @@
-/path/to/image_0.png
-/path/to/image_1_0.png,/path/to/image_1_1.png
+tmp/1.png
+tmp/1.png
+tmp/1.png
+tmp/1.png

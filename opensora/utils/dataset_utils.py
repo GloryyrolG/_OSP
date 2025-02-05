@@ -75,22 +75,39 @@ class Collate:
         input_ids = [i['input_ids'] for i in batch]  # b [1 l]
         cond_mask = [i['cond_mask'] for i in batch]  # b [1 l]
         
-        kpmaps = [i['kpmaps'] for i in batch]
-        vid_pth = [i['vid_pth'] for i in batch]
-        return batch_tubes, input_ids, cond_mask, kpmaps, vid_pth
+        txt = [i.get('txt', None) for i in batch]
+        kpmaps = [i.get('kpmaps', None) for i in batch]
+        vid_pth = [i.get('vid_pth', None) for i in batch]
+        return batch_tubes, input_ids, cond_mask, txt, kpmaps, vid_pth
 
-    def __call__(self, batch):
-        batch_tubes, input_ids, cond_mask, kpmaps, vid_pth = self.package(batch)
+    def __call__(self, batch) -> dict:
+        # batch_tubes, input_ids, cond_mask, txt, kpmaps, vid_pth = self.package(batch)
+        batch_l_dict = {k: [i.get(k, None) for i in batch] for k in batch[0].keys()}
+
+        # x_shape = batch[0]['pixel_values'].shape
+        # st_items = dict((k, v) for k, v in batch_l_dict.items()
+        #                      if isinstance(v[0], torch.Tensor) and v[0].shape == x_shape)
+        st_ks = [k for k in ['pixel_values', 'masked_video', 'mask', 'kpmaps', 'parts', 'deps', 'normals']
+                 if batch_l_dict[k][0] is not None]
+        batch_tubes = [torch.cat(x, dim=0) for x in zip(*(batch_l_dict[k] for k in st_ks))]
+
+        input_ids = batch_l_dict['input_ids']
+        cond_mask = batch_l_dict['cond_mask']
 
         ds_stride = self.ae_stride * self.patch_size
         t_ds_stride = self.ae_stride_t * self.patch_size_t
         
-        pad_batch_tubes, attention_mask, input_ids, cond_mask, kpmaps = self.process(batch_tubes, input_ids, cond_mask, kpmaps, t_ds_stride, ds_stride, self.max_thw, self.ae_stride_thw)
+        # All ST go to batch_tubes
+        pad_batch_tubes, attention_mask, input_ids, cond_mask = self.process(batch_tubes, input_ids, cond_mask, t_ds_stride, ds_stride, self.max_thw, self.ae_stride_thw)
         assert not torch.any(torch.isnan(pad_batch_tubes)), 'after pad_batch_tubes'
-        return pad_batch_tubes, attention_mask, input_ids, cond_mask, kpmaps, vid_pth
+        batch = dict(zip([*st_ks,
+                          'attn_mask', 'input_ids', 'cond_mask'],
+                         [*pad_batch_tubes.chunk(len(st_ks), dim=1),
+                          attention_mask, input_ids, cond_mask]))
+        batch['txt'] = batch_l_dict['txt']  # torch.cat(, dim=0)
+        return batch
 
-
-    def process(self, batch_tubes, input_ids, cond_mask, kpmaps, t_ds_stride, ds_stride, max_thw, ae_stride_thw):
+    def process(self, batch_tubes, input_ids, cond_mask, t_ds_stride, ds_stride, max_thw, ae_stride_thw):
         # pad to max multiple of ds_stride
         batch_input_size = [i.shape for i in batch_tubes]  # [(c t h w), (c t h w)]
         assert len(batch_input_size) == self.batch_size
@@ -139,7 +156,10 @@ class Collate:
         pad_batch_tubes = torch.stack(pad_batch_tubes, dim=0)
 
         assert each_pad_t_h_w == [[0, 0, 0]]
-        pad_kpmaps = torch.stack(kpmaps, dim=0)
+        # if kpmaps[0] is not None:
+        #     pad_kpmaps = torch.stack(kpmaps, dim=0)
+        # else:
+        #     pad_kpmaps = None
 
         max_tube_size = [pad_max_t, pad_max_h, pad_max_w]
         max_latent_size = [
@@ -164,7 +184,7 @@ class Collate:
         input_ids = torch.stack(input_ids)  # b 1 l
         cond_mask = torch.stack(cond_mask)  # b 1 l
 
-        return pad_batch_tubes, attention_mask, input_ids, cond_mask, pad_kpmaps
+        return pad_batch_tubes, attention_mask, input_ids, cond_mask
 
  
 def split_to_even_chunks(indices, lengths, num_chunks, batch_size):

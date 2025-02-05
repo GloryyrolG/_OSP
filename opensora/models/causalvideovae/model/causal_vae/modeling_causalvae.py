@@ -568,7 +568,7 @@ class CausalVAEModel(VideoBaseAE):
                     j : j + self.tile_latent_min_size,
                 ]
                 if self.use_quant_layer:
-                    tile = self.post_quant_conv(tile)
+                    tile = self.post_quant_conv(tile)  # 1, 4, 8, 32, 32
                 decoded = self.decoder(tile)
                 row.append(decoded)
             rows.append(row)

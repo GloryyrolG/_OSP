@@ -1,6 +1,7 @@
-CUDA_VISIBLE_DEVICES=7 python -m opensora.sample.sample_inpaint \
-    --model_path /path/to/checkpoint-xxx/model \
-    --num_frames 93 \
+MODEL_PTH="exps/motionxpp_nop_multask_sk_fuse1/checkpoint-50000/model_ema"
+CUDA_VISIBLE_DEVICES=1 taskset -c 12-23 python -m opensora.sample.sample_inpaint \
+    --model_path $MODEL_PTH \
+    --num_frames 29 \
     --height 480 \
     --width 640 \
     --cache_dir "../cache_dir" \
@@ -8,11 +9,13 @@ CUDA_VISIBLE_DEVICES=7 python -m opensora.sample.sample_inpaint \
     --text_prompt examples/prompt_list_0.txt \
     --conditional_images_path examples/conditional_images_path.txt \
     --ae CausalVAEModel_D4_4x8x8 \
-    --ae_path "/path/to/causalvideovae" \
-    --save_img_path "./sample_video_93x480p_cfg7.5_step100" \
+    --ae_path "ospv120/vae" \
+    --save_img_path "${MODEL_PTH}/test" \
     --fps 24 \
     --guidance_scale 7.5 \
-    --num_sampling_steps 100 \
+    --num_sampling_steps 20 \
     --enable_tiling \
     --max_sequence_length 512 \
-    --sample_method PDNM \
+    --sample_method PNDM \
+    --crop "true" \
+    --num_samples 16 \

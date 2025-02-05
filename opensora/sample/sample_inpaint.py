@@ -1,4 +1,6 @@
+import logging
 import math
+import random
 import os
 import torch
 import argparse
@@ -31,9 +33,33 @@ import glob
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import Lambda
+from opensora.dataset import t2v_datasets, getdataset
 from opensora.dataset.transform import ToTensorVideo, CenterCropResizeVideo, TemporalRandomCrop, LongSideResizeVideo, SpatialStrideCropVideo
 import numpy as np
 from einops import rearrange
+
+
+def preprocess_images(images, transform):
+    print(images)
+    if len(images) == 1:
+        conditional_images_indices = [0]
+    elif len(images) == 2:
+        conditional_images_indices = [0, -1]
+    else:
+        print("Only support 1 or 2 condition images!")
+        raise NotImplementedError
+    
+    try:
+        conditional_images = [Image.open(image).convert("RGB") for image in images]
+        conditional_images = [torch.from_numpy(np.copy(np.array(image))) for image in conditional_images]
+        conditional_images = [rearrange(image, 'h w c -> c h w').unsqueeze(0) for image in conditional_images]
+        conditional_images = [transform(image).to(device=device, dtype=weight_dtype) for image in conditional_images]
+    except Exception as e:
+        print('Error when loading images')
+        print(f'condition images are {images}')
+        raise e
+    return dict(conditional_images=conditional_images, conditional_images_indices=conditional_images_indices)
+
 
 def main(args):
     # torch.manual_seed(args.seed)
@@ -68,33 +94,11 @@ def main(args):
         norm_fun
     ])
 
-    def preprocess_images(images):
-        print(images)
-        if len(images) == 1:
-            conditional_images_indices = [0]
-        elif len(images) == 2:
-            conditional_images_indices = [0, -1]
-        else:
-            print("Only support 1 or 2 condition images!")
-            raise NotImplementedError
-        
-        try:
-            conditional_images = [Image.open(image).convert("RGB") for image in images]
-            conditional_images = [torch.from_numpy(np.copy(np.array(image))) for image in conditional_images]
-            conditional_images = [rearrange(image, 'h w c -> c h w').unsqueeze(0) for image in conditional_images]
-            conditional_images = [transform(image).to(device=device, dtype=weight_dtype) for image in conditional_images]
-        except Exception as e:
-            print('Error when loading images')
-            print(f'condition images are {images}')
-            raise e
-        return dict(conditional_images=conditional_images, conditional_images_indices=conditional_images_indices)
-
-
     transformer_model = OpenSoraInpaint.from_pretrained(args.model_path, cache_dir=args.cache_dir, 
                                                         low_cpu_mem_usage=False, device_map=None, torch_dtype=weight_dtype)
 
-    text_encoder = MT5EncoderModel.from_pretrained(args.text_encoder_name, cache_dir=args.cache_dir, low_cpu_mem_usage=True, torch_dtype=weight_dtype)
-    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_name, cache_dir=args.cache_dir)
+    text_encoder = MT5EncoderModel.from_pretrained("mt5-xxl", cache_dir=args.cache_dir, low_cpu_mem_usage=True, torch_dtype=weight_dtype)
+    tokenizer = AutoTokenizer.from_pretrained("mt5-xxl", cache_dir=args.cache_dir)
 
     # set eval mode
     transformer_model.eval()
@@ -183,13 +187,47 @@ def main(args):
     nsfw, lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, 
     low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry.
     """
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = t2v_datasets.logger = logging.getLogger()  # no accelerate
+    args.__dict__.update(max_height=args.height, max_width=args.width, dataset='inpaint',
+                         i2v_ratio=1, transition_ratio=0, v2v_ratio=0, clear_video_ratio=0)
+    dataset = getdataset(args)
+
+    with open('examples/clips.txt') as fp:
+        clips = [i.strip() for i in fp.readlines()]
+    if len(clips):
+        hs = {hash(cap['path'].split('/')[-1]): idx for idx, cap in enumerate(t2v_datasets.dataset_prog.cap_list)}
+        sel_ids = [hs[hash(clip.split('/')[-1])] for clip in clips]
+    else:
+        # random choose 4 from cap_list without replace
+        sel_ids = random.choices(range(len(dataset)), k=args.num_samples)
+    logger.info("Selected cap_list ids!")
 
     video_grids = []
-    for idx, (prompt, images) in enumerate(zip(text_prompt, conditional_images)):
+    # for idx, (prompt, images) in enumerate(zip(text_prompt, conditional_images)):
+    #     pre_results = preprocess_images(images, transform)
+    #     cond_imgs = pre_results['conditional_images']
+    #     cond_imgs_indices = pre_results['conditional_images_indices']
+    text_prompt = []
+    for idx in range(len(sel_ids)):
+        didx = sel_ids[idx]
+        data = dataset[didx]
+        cond_imgs = [data['pixel_values'][:, 0]]  # (m d)
+        cond_imgs_indices = [0]
 
-        pre_results = preprocess_images(images)
-        cond_imgs = pre_results['conditional_images']
-        cond_imgs_indices = pre_results['conditional_images_indices']
+        prompt = data['txt'][0]
+        text_prompt.append(dataset[didx]["vid_pth"])
+        logger.info(f"{'>>>' * 10} prompt {dataset[didx]['vid_pth']}!")
+        # data['kpmaps'] = data['kpmaps'][None].to(dtype=weight_dtype, device=device)
+
+        if True:
+            data1 = dataset[sel_ids[(idx + 1) % len(sel_ids)]]
+            data['deps1'] = data1['deps'].clone()
+
+        data = {k: v[None].to(dtype=weight_dtype, device=device)
+                for k, v in data.items()
+                if isinstance(v, torch.Tensor)}  # txt, vid_pth
 
         videos = pipeline(
             conditional_images=cond_imgs,
@@ -205,7 +243,12 @@ def main(args):
             mask_feature=True,
             device=args.device, 
             max_sequence_length=args.max_sequence_length, 
+
+            data=data,
         ).images
+        # if pipeline.transformer.latent_pose is not None and pipeline.transformer.latent_pose.startswith('aa'):
+        videos[..., : 3] = (0.6 * videos[..., : 3] + 0.4 * ((data['kpmaps'] + 1) / 2 * 255).permute(0, 2, 3, 4, 1).cpu()).to(torch.uint8)
+        videos = rearrange(videos, 'b t h w (m d) -> b t (m h) w d', d=3)
         try:
             if args.num_frames == 1:
                 ext = 'jpg'
@@ -229,6 +272,9 @@ def main(args):
     else:
         video_grids = save_video_grid(video_grids)
         imageio.mimwrite(os.path.join(args.save_img_path, f'{args.sample_method}_gs{args.guidance_scale}_s{args.num_sampling_steps}.{ext}'), video_grids, fps=args.fps, quality=6)
+
+    with open(os.path.join(args.save_img_path, 'txts.txt'), 'w') as f:
+        f.write('\n'.join(text_prompt))
 
     print('save path {}'.format(args.save_img_path))
 
@@ -259,6 +305,10 @@ if __name__ == "__main__":
     parser.add_argument('--save_memory', action='store_true')
 
     parser.add_argument('--conditional_images_path', type=str, help='the path of txt file containing the paths of condition images')
+
+    # parser.add_argument('--latent_pose', type=str)
+    parser.add_argument('--crop', type=str)
+    parser.add_argument('--num_samples', default=4, type=int)
     args = parser.parse_args()
 
     main(args)

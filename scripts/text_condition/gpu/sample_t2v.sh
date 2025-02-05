@@ -1,4 +1,4 @@
-MODEL_PTH="exps/webvid10m_fps8_ft/checkpoint-5000/model_ema"
+MODEL_PTH="exps/motionxpp_ft-1/checkpoint-32000/model_ema"
 CUDA_VISIBLE_DEVICES=0 python \
 opensora/sample/sample_t2v.py \
     --model_path $MODEL_PTH \
@@ -9,13 +9,14 @@ opensora/sample/sample_t2v.py \
     --text_encoder_name google/mt5-xxl \
     --text_prompt examples/prompt_list_0.txt \
     --ae CausalVAEModel_D4_4x8x8 \
-    --ae_path models/vae \
+    --ae_path ospv120/vae \
     --save_img_path "${MODEL_PTH}/test" \
-    --fps 8 \
+    --fps 24 \
     --guidance_scale 2.5 \
     --num_sampling_steps 20 \
     --enable_tiling \
     --max_sequence_length 512 \
     --sample_method EulerAncestralDiscrete \
-    --model_type "dit"
+    --model_type "dit" \
+    --crop "false" \
     # --fps 24 \

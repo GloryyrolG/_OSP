@@ -6,6 +6,7 @@ from einops import rearrange
 import numpy as np
 
 from opensora.models.causalvideovae.model.modules.conv import Conv2d
+from opensora.models.diffusion.opensora.modules import PatchEmbed2D
 
 
 class RepeatCat(nn.Module):
@@ -18,7 +19,7 @@ class RepeatCat(nn.Module):
 
 
 class PoseGuider(nn.Module):
-    def __init__(self, noise_latent_channels=4):
+    def __init__(self, noise_latent_channels=4, latent_pose='aa', final_proj=None):
         super(PoseGuider, self).__init__()
 
         self.conv_layers = nn.Sequential(
@@ -63,7 +64,13 @@ class PoseGuider(nn.Module):
         )
 
         # Final projection layer
-        self.final_proj = Conv2d(in_channels=128, out_channels=noise_latent_channels, kernel_size=1)
+        self.latent_pose = latent_pose
+        if self.latent_pose == 'aa':
+            self.final_proj = Conv2d(in_channels=128, out_channels=noise_latent_channels, kernel_size=1)
+        elif self.latent_pose in ['aa_hack', 'ipi0']:
+            self.final_proj = final_proj
+        else:
+            raise ValueError
 
         # Initialize layers
         self._initialize_weights()
@@ -92,18 +99,22 @@ class PoseGuider(nn.Module):
                     init.zeros_(m.bias)
 
         # For the final projection layer, initialize weights to zero (or you may choose to use He initialization here as well)
-        init.zeros_(self.final_proj.weight)
-        if self.final_proj.bias is not None:
-            init.zeros_(self.final_proj.bias)
+        # init.zeros_(self.final_proj.weight)
+        # if self.final_proj.bias is not None:
+        #     init.zeros_(self.final_proj.bias)
+        for p in self.final_proj.parameters():
+            nn.init.zeros_(p)
 
-
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         # assert x.dim() == 5
         # video_length = x.shape[2]
         # x = rearrange(x, "b c f h w -> (b f) c h w")
 
         x = self.conv_layers(x)
-        x = self.final_proj(x)
+        x = self.final_proj(x, **kwargs)
+
+        if self.latent_pose in ['aa_hack', 'ipi0']:
+            x = x[0]
 
         # x = rearrange(x, "(b f) c h w -> b f c h w", f=video_length)
 

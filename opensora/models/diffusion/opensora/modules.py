@@ -30,7 +30,16 @@ except:
     set_run_dtype = None
     from opensora.utils.parallel_states import get_sequence_parallel_state, nccl_info
     from opensora.utils.communications import all_to_all_SBH
+
+from opensora.models.causalvideovae.model.modules.updownsample import TimeUpsampleRes2x
 logger = logging.get_logger(__name__)
+
+
+def zero_module(module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
+
 
 def get_3d_sincos_pos_embed(
     embed_dim, grid_size, cls_token=False, extra_tokens=0, interpolation_scale=1.0, base_size=16, 
@@ -139,6 +148,69 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 
+class ModuleList(nn.ModuleList):
+    def __init__(self, *args, **kwargs):
+        super(ModuleList, self).__init__(*args, **kwargs)
+    
+    def forward(self, *args, **kwargs):
+        """ Refer to PatchEmbed2D and transformer_blocks, enable fwd """
+        x = self[0](*args, **kwargs)
+        for m in self[1:]:
+            x = m(x)
+        return x
+
+
+class _UnpatchifyOutTime(nn.Module):
+    """ _get_output_for_patched_inputs """
+    def __init__(self, norm_type='ada_norm_single', inner_dim=2304, patch_size_t=4, patch_size=2,
+                 out_channels=4, uprate=[0, 0, 0]):
+        assert norm_type == 'ada_norm_single'
+        super(_UnpatchifyOutTime, self).__init__()
+        self.inner_dim = inner_dim
+        self.patch_size_t = patch_size_t
+        self.patch_size = patch_size
+        self.out_channels = out_channels
+        self.scale_shift_table = nn.Parameter(
+            torch.randn(2, self.inner_dim) / self.inner_dim**0.5)
+        self.norm_out = nn.LayerNorm(
+            self.inner_dim, elementwise_affine=False, eps=1e-6)
+        self.proj_out = nn.Linear(
+            self.inner_dim, self.patch_size_t * self.patch_size * self.patch_size * self.out_channels)
+        
+        if uprate[1] and uprate[2]:
+            raise NotImplementedError
+        if uprate[0]:
+            # raise NotImplementedError
+            up = []
+            for _ in range(uprate[0]):
+                up.append(TimeUpsampleRes2x(self.out_channels, self.out_channels))
+                if _ < uprate[0] - 1:
+                    up.extend([nn.LayerNorm(self.out_channels, elementwise_affine=False),
+                               nn.SiLU()])
+            self.up = nn.ModuleList(up)
+    
+    def load_state_dict_from_pt(self, osp):
+        self.scale_shift_table.data = osp.scale_shift_table.data
+        self.proj_out.load_state_dict(osp.proj_out.state_dict())
+
+    def forward(self, hidden_states, embedded_timestep, num_frames=8, height=30):
+        shift, scale = (self.scale_shift_table[None] + embedded_timestep[:, None]).chunk(2, dim=1)
+        hidden_states = self.norm_out(hidden_states)  # nothing to do with batch dim
+        # Modulation
+        hidden_states = hidden_states * (1 + scale) + shift
+        hidden_states = self.proj_out(hidden_states)
+        hidden_states = hidden_states.squeeze(1)        
+
+        output = rearrange(hidden_states, 'b (t h w) (m o p q d) -> b (m d) (t o) (h p) (w q)',
+            t=num_frames, h=height, o=self.patch_size_t, p=self.patch_size,
+            q=self.patch_size, d=self.out_channels)
+
+        if hasattr(self, 'up'):
+            output = self.up(output)
+        
+        return output
+
+
 class PatchEmbed2D(nn.Module):
     """2D Image to Patch Embedding but with 3D position embedding"""
 
@@ -156,7 +228,8 @@ class PatchEmbed2D(nn.Module):
         bias=True,
         interpolation_scale=(1, 1),
         interpolation_scale_t=1,
-        use_abs_pos=True, 
+        use_abs_pos=True,
+        # zeroout=False, 
     ):
         super().__init__()
         # assert num_frames == 1
@@ -192,7 +265,12 @@ class PatchEmbed2D(nn.Module):
         self.register_buffer("temp_pos_embed", torch.from_numpy(temp_pos_embed).float().unsqueeze(0), persistent=False)
         # self.temp_embed_gate = nn.Parameter(torch.tensor([0.0]))
 
-    def forward(self, latent, num_frames):
+        # if zeroout:
+        #     self.proj.weight.data.zero_()
+        #     if bias:
+        #         self.proj.bias.data.zero_()
+
+    def forward(self, latent, num_frames, return_img=True):
         b, _, _, _, _ = latent.shape
         video_latent, image_latent = None, None
         # b c 1 h w
@@ -270,6 +348,7 @@ class PatchEmbed2D(nn.Module):
         video_latent, image_latent = latent[:, :num_frames], latent[:, num_frames:]
 
         if self.use_abs_pos:
+            raise NotImplementedError
             # temp_pos_embed = temp_pos_embed.unsqueeze(2) * self.temp_embed_gate.tanh()
             temp_pos_embed = temp_pos_embed.unsqueeze(2)
             video_latent = (video_latent + temp_pos_embed).to(video_latent.dtype) if video_latent is not None and video_latent.numel() > 0 else None
@@ -282,7 +361,13 @@ class PatchEmbed2D(nn.Module):
             image_latent = video_latent
             video_latent = None
         # print('video_latent is None, image_latent is None', video_latent is None, image_latent is None)
-        return video_latent, image_latent
+        # Add return_img=False to facilitate the concatenation with the following module x=m(x)
+        # in the nn.ModuleList sequence forward
+        # assert image_latent is None  #TODO: train img
+        if not return_img:
+            return video_latent
+        else:
+            return video_latent, image_latent
     
 
 
@@ -752,7 +837,9 @@ class AttnProcessor2_0:
 
         query = attn.to_q(hidden_states)
 
+        xattn = True
         if encoder_hidden_states is None:
+            xattn = False
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
@@ -910,10 +997,20 @@ class AttnProcessor2_0:
                             query, key, value, dropout_p=0.0, is_causal=False
                         )
                 elif self.attention_mode == 'xformers':
+                    if hasattr(self, 'attnsaver'):  # xattn:
+                        # https://github.com/pytorch/pytorch/issues/119811#issuecomment-2210624197
+                        value1 = torch.cat([value, torch.eye(value.shape[-2], dtype=value.dtype, device=value.device)[
+                                           None, None].repeat(batch_size, attn.heads, 1, 1)], dim=-1)
+                    else:
+                        value1 = value
                     with torch.backends.cuda.sdp_kernel(enable_math=False, enable_flash=False, enable_mem_efficient=True):
-                        hidden_states = F.scaled_dot_product_attention(
-                            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+                        hidden_states1 = F.scaled_dot_product_attention(
+                            query, key, value1, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
                         )
+                    hidden_states = hidden_states1[..., : head_dim]
+                    self.attn_weights = hidden_states1[..., head_dim:]  #TODO: p2p global ctrller
+                    # attn_weights = torch.einsum('b h n d, b h m d -> b h n m', query, key)
+                    # attn_weights = (attn_weights * head_dim ** -0.5).softmax(dim=-1)
                 elif self.attention_mode == 'math':
                     hidden_states = F.scaled_dot_product_attention(
                         query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
@@ -922,6 +1019,10 @@ class AttnProcessor2_0:
                     raise NotImplementedError(f'Found attention_mode: {self.attention_mode}')
                 hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
+
+        if kwargs.get('add_hidden_states') is not None:
+            # https://github.com/tencent-ailab/IP-Adapter/blob/main/ip_adapter/attention_processor.py#L397
+            hidden_states = hidden_states + kwargs['add_hidden_states']
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
@@ -932,11 +1033,13 @@ class AttnProcessor2_0:
             hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
         if attn.residual_connection:
+            raise NotImplementedError
             hidden_states = hidden_states + residual
 
         hidden_states = hidden_states / attn.rescale_output_factor
 
         if attn.downsampler is not None:
+            raise NotImplementedError
             hidden_states = attn.downsampler.reverse(hidden_states, t=frame, h=height, w=width)
         return hidden_states
 
@@ -1083,6 +1186,10 @@ class BasicTransformerBlock(nn.Module):
         downsampler: str = None, 
         use_rope: bool = False, 
         interpolation_scale_thw: Tuple[int] = (1, 1, 1), 
+        # zeroout = False,
+        skips_in = 0,
+        # ski = False,
+        pose_attn = False,
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
@@ -1132,20 +1239,22 @@ class BasicTransformerBlock(nn.Module):
         else:
             self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
 
-        self.attn1 = Attention(
-            query_dim=dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
-            dropout=dropout,
-            bias=attention_bias,
-            cross_attention_dim=cross_attention_dim if only_cross_attention else None,
-            upcast_attention=upcast_attention,
-            out_bias=attention_out_bias,
-            attention_mode=attention_mode, 
-            downsampler=downsampler, 
-            use_rope=use_rope, 
-            interpolation_scale_thw=interpolation_scale_thw, 
-        )
+        attn_cmd = f'Attention( \
+            query_dim={dim}, \
+            heads={num_attention_heads}, \
+            dim_head={attention_head_dim}, \
+            dropout={dropout}, \
+            bias={attention_bias}, \
+            cross_attention_dim={{cross_attention_dim}}, \
+            upcast_attention={upcast_attention}, \
+            out_bias={attention_out_bias}, \
+            attention_mode="{attention_mode}", \
+            downsampler={{downsampler}}, \
+            use_rope={{use_rope}}, \
+            interpolation_scale_thw={interpolation_scale_thw}, \
+        )'
+        self.attn1 = eval(attn_cmd.format(cross_attention_dim=cross_attention_dim if only_cross_attention else None,
+                                          downsampler=downsampler, use_rope=use_rope))
 
         # 2. Cross-Attn
         if cross_attention_dim is not None or double_self_attention:
@@ -1166,20 +1275,31 @@ class BasicTransformerBlock(nn.Module):
             else:
                 self.norm2 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
 
-            self.attn2 = Attention(
-                query_dim=dim,
-                cross_attention_dim=cross_attention_dim if not double_self_attention else None,
-                heads=num_attention_heads,
-                dim_head=attention_head_dim,
-                dropout=dropout,
-                bias=attention_bias,
-                upcast_attention=upcast_attention,
-                out_bias=attention_out_bias,
-                attention_mode=attention_mode, 
-                downsampler=False, 
-                use_rope=False, 
-                interpolation_scale_thw=interpolation_scale_thw, 
-            )  # is self-attn if encoder_hidden_states is none
+            # ca_cmd = f'Attention(\
+            #     query_dim={dim},\
+            #     cross_attention_dim={cross_attention_dim if not double_self_attention else None},\
+            #     heads={num_attention_heads},\
+            #     dim_head={attention_head_dim},\
+            #     dropout={dropout},\
+            #     bias={attention_bias},\
+            #     upcast_attention={upcast_attention},\
+            #     out_bias={attention_out_bias},\
+            #     attention_mode="{attention_mode}",\
+            #     downsampler={False},\
+            #     use_rope={False},\
+            #     interpolation_scale_thw={interpolation_scale_thw},\
+            # )'  # is self-attn if encoder_hidden_states is none
+            self.attn2 = eval(attn_cmd.format(cross_attention_dim=cross_attention_dim if not double_self_attention else None,
+                                              downsampler=False, use_rope=False))
+            
+            if pose_attn:
+                use_rope_t = True  # use_rope
+                print(f"{'>>>' * 10} pose_attn use_rope_t={use_rope_t}!")
+                self.pose_attn = eval(attn_cmd.format(cross_attention_dim=cross_attention_dim if not double_self_attention else None,
+                                                      downsampler=downsampler, use_rope=use_rope_t))
+                self.ctrlnxt = False  # False
+                if not self.ctrlnxt:  # ctrlnet
+                    self.pose_attn.to_out = zero_module(self.pose_attn.to_out)
         else:
             self.norm2 = None
             self.attn2 = None
@@ -1237,6 +1357,16 @@ class BasicTransformerBlock(nn.Module):
         # let chunk size default to None
         self._chunk_size = None
         self._chunk_dim = 0
+        
+        # self.ski = ski
+        if skips_in:
+            self.skips_in = zero_module(nn.Linear(dim + skips_in, dim))
+        
+        # self.zeroout = zeroout
+        # if self.zeroout:
+        #     self.ff.net[2].weight.data.zero_()
+        #     if self.ff.net[2].bias is not None:
+        #         self.ff.net[2].bias.data.zero_()
 
     def set_chunk_feed_forward(self, chunk_size: Optional[int], dim: int = 0):
         # Sets chunk feed-forward
@@ -1246,6 +1376,8 @@ class BasicTransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.FloatTensor,
+        skips = None,
+        latent_poses = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
@@ -1254,7 +1386,8 @@ class BasicTransformerBlock(nn.Module):
         class_labels: Optional[torch.LongTensor] = None,
         frame: int = None, 
         height: int = None, 
-        width: int = None, 
+        width: int = None,
+        batch_size = 1, 
         added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.FloatTensor:
         if cross_attention_kwargs is not None:
@@ -1264,6 +1397,9 @@ class BasicTransformerBlock(nn.Module):
         # Notice that normalization is always applied before the real computation in the following blocks.
         # 0. Self-Attention
         batch_size = hidden_states.shape[0]
+
+        if hasattr(self, 'skips_in'):
+            hidden_states = hidden_states + self.skips_in(torch.cat([hidden_states, skips], dim=-1))
 
         # import ipdb;ipdb.set_trace()
         if self.norm_type == "ada_norm":
@@ -1288,7 +1424,7 @@ class BasicTransformerBlock(nn.Module):
             else:
                 shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                         self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
-                ).chunk(6, dim=1)
+                ).chunk(6, dim=1)  #TODO: study attn
             norm_hidden_states = self.norm1(hidden_states)
             norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
             # norm_hidden_states = norm_hidden_states.squeeze(1)
@@ -1296,18 +1432,46 @@ class BasicTransformerBlock(nn.Module):
             raise ValueError("Incorrect norm used")
 
         if self.pos_embed is not None:
+            raise NotImplementedError
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
         # 1. Prepare GLIGEN inputs
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
+        assert attention_mask.abs().sum() < 1e-6
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=attention_mask, frame=frame, height=height, width=width, 
             **cross_attention_kwargs,
         )
+
+        if False:  # hasattr(self, 'pose_attn'):
+            norm_latent_poses = self.norm1(latent_poses)
+            norm_latent_poses = norm_latent_poses * (1 + scale_msa) + shift_msa
+            norm_hidden_states_pose = torch.cat([norm_hidden_states, norm_latent_poses], dim=1)
+            norm_hidden_states_pose = rearrange(norm_hidden_states_pose, 'b (m t n) d -> (b t) (m n) d', m=2, t=frame)
+            attention_mask_pose = rearrange(attention_mask, 'b 1 (t n) -> (b t) 1 n', t=frame).repeat(1, 1, 2)
+            attn_output_pose = self.pose_attn(
+                norm_hidden_states_pose,
+                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                attention_mask=attention_mask_pose,
+                frame=1, height=2 * height, width=width, 
+                **cross_attention_kwargs,
+            )  # 1e1 vs 5e-2
+            # attn_output_pose = rearrange(attn_output_pose, '(b t) (m n) d -> b m (t n) d', m=2, t=frame)[:, 0]  # KV, spatial selfattn
+            attn_output_pose = rearrange(attn_output_pose, '(b t) (m n) d -> b m (t n) d', m=2, t=frame)[:, 1]  # xattn
+
+            if self.ctrlnxt:  # Jiayu's Tora exp
+                attn_output_pose_norm = ((attn_output_pose - attn_output_pose.mean((-2, -1), keepdim=True))
+                                         / (attn_output_pose.std((-2, -1), keepdim=True) + 1e-8))  #TODO: head
+                attn_output_pose_renorm = (attn_output_pose_norm * attn_output.std((-2, -1), keepdim=True)
+                                           + attn_output.mean((-2, -1), keepdim=True))
+                attn_output = attn_output + attn_output_pose_renorm
+            else:
+                attn_output = attn_output + attn_output_pose
+        
         if self.norm_type == "ada_norm_zero":
             attn_output = gate_msa.unsqueeze(1) * attn_output
         elif self.norm_type == "ada_norm_single":
@@ -1323,6 +1487,7 @@ class BasicTransformerBlock(nn.Module):
 
         # 3. Cross-Attention
         if self.attn2 is not None:
+            assert self.norm_type == 'ada_norm_single'
             if self.norm_type == "ada_norm":
                 norm_hidden_states = self.norm2(hidden_states, timestep)
             elif self.norm_type in ["ada_norm_zero", "layer_norm", "layer_norm_i2vgen"]:
@@ -1344,8 +1509,39 @@ class BasicTransformerBlock(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
                 **cross_attention_kwargs,
-            )
+            )  #TODO: CA *attn_output too small wrt hidden_states
             hidden_states = attn_output + hidden_states
+            
+            if hasattr(self, 'pose_attn'):
+                # QK same dim if use_rope. Latent pose V is not good (Animate-X's MA?)
+                pose_attn = 'spatial'
+                if pose_attn == 'spatial':
+                    norm_hidden_states_pose = rearrange(norm_hidden_states, 'b (t m) d -> (b t) m d', t=frame)
+                    encoder_hidden_states_pose = rearrange(latent_poses, 'b (t n) d -> (b t) n d', t=frame)  #TODO: 5e-1 vs 1e-2, norm?
+                    attention_mask_pose = rearrange(attention_mask, 'b 1 (t n) -> (b t) 1 n', t=frame)
+                else:
+                    pass  #TODO: temporal global motion
+                if self.pose_attn.processor.use_rope:
+                    pe_kwargs = {'frame': 1, 'height': height, 'width': width}
+                else:
+                    pe_kwargs = {}
+                assert not len(cross_attention_kwargs)
+                pose_attn_output = self.pose_attn(
+                    norm_hidden_states_pose,
+                    encoder_hidden_states=encoder_hidden_states_pose,
+                    attention_mask=attention_mask_pose,
+                    **pe_kwargs,
+                    **cross_attention_kwargs,
+                )
+                if pose_attn == 'spatial':
+                    attn_output_pose = rearrange(pose_attn_output, '(b t) m d -> b (t m) d', t=frame)
+                if self.ctrlnxt:  # Jiayu's Tora exp
+                    attn_output_pose_norm = ((attn_output_pose - attn_output_pose.mean((-2, -1), keepdim=True))
+                                             / (attn_output_pose.std((-2, -1), keepdim=True) + 1e-8))  # TODO: head
+                    attn_output_pose_renorm = (attn_output_pose_norm * hidden_states.std((-2, -1), keepdim=True)
+                                               + hidden_states.mean((-2, -1), keepdim=True))
+                    attn_output_pose = attn_output_pose_renorm
+                hidden_states = attn_output_pose + hidden_states
 
         # 4. Feed-forward
         # i2vgen doesn't have this norm 🤷‍♂️
@@ -1360,7 +1556,7 @@ class BasicTransformerBlock(nn.Module):
         if self.norm_type == "ada_norm_single":
             norm_hidden_states = self.norm2(hidden_states)
             norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
-
+        
         # if self._chunk_size is not None:
         #     # "feed_forward_chunk_size" can be used to save memory
         #     ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
@@ -1376,8 +1572,154 @@ class BasicTransformerBlock(nn.Module):
         elif self.norm_type == "ada_norm_single":
             ff_output = gate_mlp * ff_output
 
+        # if self.zeroout:
+        #     hidden_states = ff_output
+        # else:
         hidden_states = ff_output + hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
         return hidden_states
+
+
+class ModalSpatialAttnBlk(nn.Module):
+    """ No timestep """
+    def __init__(self,
+                 dim: int,
+                 num_attention_heads: int,
+                 attention_head_dim: int,
+                 dropout=0.0,
+                 cross_attention_dim: Optional[int] = None,
+                 activation_fn: str = "geglu",
+                 num_embeds_ada_norm: Optional[int] = None,
+                 attention_bias: bool = False,
+                 only_cross_attention: bool = False,
+                 double_self_attention: bool = False,
+                 upcast_attention: bool = False,
+                 norm_elementwise_affine: bool = True,
+                 # 'layer_norm', 'ada_norm', 'ada_norm_zero', 'ada_norm_single', 'ada_norm_continuous', 'layer_norm_i2vgen'
+                 norm_type: str = "layer_norm",
+                 norm_eps: float = 1e-5,
+                 final_dropout: bool = False,
+                 attention_type: str = "default",
+                 positional_embeddings: Optional[str] = None,
+                 num_positional_embeddings: Optional[int] = None,
+                 ada_norm_continous_conditioning_embedding_dim: Optional[int] = None,
+                 ada_norm_bias: Optional[int] = None,
+                 ff_inner_dim: Optional[int] = None,
+                 ff_bias: bool = True,
+                 attention_out_bias: bool = True,
+                 attention_mode: str = "xformers",
+                 downsampler: str = None,
+                 use_rope: bool = False,
+                 interpolation_scale_thw: Tuple[int] = (1, 1, 1),
+                 # zeroout = False,
+                 skips_in=0,
+                 # ski = False,
+                 # dt=8,
+                 nmodals=1,
+                 ):
+        assert norm_type == 'ada_norm_single'
+        super(ModalSpatialAttnBlk, self).__init__()
+        self.dim = dim
+        # self.dt = dt
+        self.norm = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
+        sa_cmd = f'Attention( \
+            query_dim={dim}, \
+            heads={num_attention_heads}, \
+            dim_head={attention_head_dim}, \
+            dropout={dropout}, \
+            bias={attention_bias}, \
+            cross_attention_dim={cross_attention_dim if only_cross_attention else None}, \
+            upcast_attention={upcast_attention}, \
+            out_bias={attention_out_bias}, \
+            attention_mode="{attention_mode}", \
+            downsampler={downsampler}, \
+            use_rope={use_rope}, \
+            interpolation_scale_thw={interpolation_scale_thw}, \
+        )'
+        # self.attn_modal_spatial = ModuleList([eval(sa_cmd),
+        #                                       zero_module(nn.Linear(dim, dim, bias=False))])
+        self.attn_modal_spatial = eval(sa_cmd)
+        self.nmodals = nmodals
+        if False:
+            self.main_zeroout = zero_module(nn.Linear(nmodals * dim, dim))
+            self.mutual_fusion = zero_module(nn.Linear(nmodals * dim, (nmodals - 1) * dim))
+        else:
+            self.attn_modal_spatial.to_out[0] = zero_module(self.attn_modal_spatial.to_out[0])
+            self.main_zeroout = zero_module(nn.Linear(dim, dim, bias=False))
+
+    def load_state_dict_from_pt(self, module):
+        if isinstance(module, nn.ModuleList):
+            self.attn_modal_spatial.load_state_dict(module[0].attn1.state_dict())
+        else:
+            self.attn_modal_spatial.load_state_dict(module.attn1.state_dict())
+        if not hasattr(self, 'mutual_fusion'):
+            self.attn_modal_spatial.to_out[0] = zero_module(self.attn_modal_spatial.to_out[0])
+
+    def forward(self,
+                hidden_states: torch.FloatTensor,
+                skips=None,
+                attention_mask: Optional[torch.FloatTensor] = None,
+                encoder_hidden_states: Optional[torch.FloatTensor] = None,
+                encoder_attention_mask: Optional[torch.FloatTensor] = None,
+                timestep: Optional[torch.LongTensor] = None,
+                cross_attention_kwargs: Dict[str, Any] = None,
+                class_labels: Optional[torch.LongTensor] = None,
+                frame: int = None,
+                height: int = None,
+                width: int = None,
+                batch_size = 1,
+                added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+                ):
+        if hidden_states.shape[-1] == self.dim:
+            m = hidden_states.shape[0] // batch_size
+            pattern_x = '(m b) (t n) d -> (b t) (m n) d'
+            inv_pattern = '(b t) (m n) d -> (m b) (t n) d'
+            pattern_cond = '(m b) 1 (t n) -> (b t) 1 (m n)'
+        else:
+            m = hidden_states.shape[-1] // self.dim
+            pattern_x = 'b (t n) (m d) -> (b t) (m n) d'
+            inv_pattern = '(b t) (m n) d -> b (t n) (m d)'
+            pattern_cond = 'b 1 (t n) -> (b t) 1 n'
+        hidden_states = rearrange(hidden_states, pattern_x, m=m, t=frame)
+        attention_mask = rearrange(attention_mask, pattern_cond, b=batch_size, t=frame)
+        attention_mask = attention_mask.repeat(1, 1, hidden_states.shape[1] // attention_mask.shape[-1])
+        norm_hidden_states = self.norm(hidden_states)
+        # norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+        cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
+        # idol, pnp
+        attn_output = self.attn_modal_spatial(
+            norm_hidden_states,
+            encoder_hidden_states=None,
+            attention_mask=attention_mask, frame=1, height=m * height, width=width,  # attn_msk 0?
+            **cross_attention_kwargs,
+        )  
+        # ff_output = gate_mlp * ff_output
+        
+        if hasattr(self, 'mutual_fusion'):
+            # hidden_states = attn_output + hidden_states
+            # attn_output = self.norm(hidden_states)  #TODO: rgb + (rgb', others')' instead of
+            # rgb + rgb'
+            # orig_attn_output = attn_output.clone()
+            attn_output = rearrange(attn_output, 'b (m n) d -> b n (m d)', m=m).clone()
+            attn_output = torch.cat([self.main_zeroout(attn_output),
+                                     self.mutual_fusion(attn_output)], dim=-1)
+            attn_output = rearrange(attn_output, 'b n (m d) -> b (m n) d', m=m)
+        else:
+            attn_output[:, : height * width] = self.main_zeroout(attn_output[:, : height * width].clone())
+        hidden_states = attn_output + hidden_states
+        hidden_states = rearrange(hidden_states, inv_pattern, m=m, t=frame)
+        return hidden_states
+
+
+class EmbLayers(nn.Module):
+    def __init__(self, in_channels, embedding_dim=2304):
+        super(EmbLayers, self).__init__()
+        self.embs = nn.ModuleList([zero_module(nn.Linear(in_channels, embedding_dim)) for _ in range(2)])
+        self.linears = nn.ModuleList([zero_module(nn.Linear(embedding_dim, 6 * embedding_dim)) for _ in range(2)])
+
+    def forward(self, x):
+        embedded = torch.cat([self.embs[0](x[: 1]), self.embs[1](x[1:])], dim=0)
+        mod = torch.cat([self.linears[0](F.silu(embedded[: 1])), self.linears[1](F.silu(embedded[1:]))], dim=0)
+        return mod, embedded

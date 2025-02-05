@@ -11,7 +11,8 @@ import sys; sys.path.append('/mnt/data/rongyu/projects/Open-Sora-Plan/')
 import argparse
 import logging
 import math
-import os
+import os; os.environ['WANDB_API_KEY'] = '8cae2c1555835acf0ad8e21bda421e55ef1074dd'
+import random
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -72,12 +73,13 @@ logger = get_logger(__name__)
 
 
 @torch.inference_mode()
-def log_validation(args, model, vae, text_encoder, tokenizer, accelerator, weight_dtype, global_step, ema=False):
+def log_validation(args, model, vae, text_encoder, tokenizer, accelerator, weight_dtype,
+                   global_step, ema=False, dataset=None):
     positive_prompt = "(masterpiece), (best quality), (ultra-detailed), {}. emotional, harmonious, vignette, 4k epic detailed, shot on kodak, 35mm photo, sharp focus, high budget, cinemascope, moody, epic, gorgeous"
     negative_prompt = """nsfw, lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, 
                         """
     validation_prompt = [
-        "A man is doing a jumpy dance",
+        # "A man is doing a jumpy dance",
         # "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about.",
         # "A serene underwater scene featuring a sea turtle swimming through a coral reef. The turtle, with its greenish-brown shell, is the main focus of the video, swimming gracefully towards the right side of the frame. The coral reef, teeming with life, is visible in the background, providing a vibrant and colorful backdrop to the turtle's journey. Several small fish, darting around the turtle, add a sense of movement and dynamism to the scene."
         ]
@@ -87,10 +89,6 @@ def log_validation(args, model, vae, text_encoder, tokenizer, accelerator, weigh
             # "这是一个宁静的水下场景，一只海龟游过珊瑚礁。海龟带着绿褐色的龟壳，优雅地游向画面右侧，成为视频的焦点。背景中的珊瑚礁生机盎然，为海龟的旅程提供了生动多彩的背景。几条小鱼在海龟周围穿梭，为画面增添了动感和活力。"
             ]
         validation_prompt += validation_prompt_cn
-    
-    data = {}
-    data['kpmaps'] = torch.from_numpy(np.load('datasets/motionxpp/11742.npy', mmap_mode='r')
-                                      ).to(device=accelerator.device, dtype=weight_dtype)
 
     logger.info(f"Running validation....\n")
     model = accelerator.unwrap_model(model)
@@ -102,8 +100,14 @@ def log_validation(args, model, vae, text_encoder, tokenizer, accelerator, weigh
                                          scheduler=scheduler,
                                          transformer=model).to(device=accelerator.device)
     videos = []
-    for prompt in validation_prompt:
-        logger.info('Processing the ({}) prompt'.format(prompt))
+    collate = Collate(args)  # leave out for simplicity
+    for i in range(1):  # validation_prompt:
+        idx = random.randint(0, len(dataset) - 1)
+        data = dataset[idx]
+        prompt = data['txt'][0]
+        validation_prompt.append(prompt)
+        data['kpmaps'] = data['kpmaps'][None].to(dtype=weight_dtype, device=accelerator.device)
+        logger.info('Processing the #{} ({}) prompt'.format(idx, prompt))
         video = opensora_pipeline(
                                 positive_prompt.format(prompt),
                                 negative_prompt=negative_prompt, 
@@ -707,8 +711,9 @@ def main(args):
                         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                         ema_model.store(model.parameters())
                         ema_model.copy_to(model.parameters())
-                        log_validation(args, model, ae, text_enc.text_enc, train_dataset.tokenizer, accelerator,
-                                    weight_dtype, progress_info.global_step, ema=True)
+                        log_validation(args, model, ae, text_enc.text_enc, train_dataset.tokenizer,
+                                       accelerator, weight_dtype, progress_info.global_step,
+                                       ema=True, dataset=train_dataset)  #TODO: valset
                         # Switch back to the original UNet parameters.
                         ema_model.restore(model.parameters())
 
@@ -720,7 +725,7 @@ def main(args):
 
     def train_one_step(step_, data_item_, prof_=None):
         train_loss = 0.0  # train_dataset is not defined?
-        x, attn_mask, input_ids, cond_mask, _, _1 = data_item_
+        x, attn_mask, input_ids, cond_mask, _, _1, _2 = data_item_
         if args.group_frame or args.group_resolution:
             if not args.group_frame:
                 each_latent_frame = torch.any(attn_mask.flatten(-2), dim=-1).int().sum(-1).tolist()
@@ -784,7 +789,8 @@ def main(args):
             with accelerator.accumulate(model):
                 assert not torch.any(torch.isnan(x)), 'after vae'
                 x = x.to(weight_dtype)
-                keys = ['pixel_values', 'attn_msk', 'input_ids', 'cond_mask', 'kpmaps', 'vid_pth']
+                keys = ['pixel_values', 'attn_msk', 'input_ids', 'cond_mask', 'txt',
+                        'kpmaps', 'vid_pth']
                 data = dict(zip(keys, data_item_))
                 data = {k: v.to(weight_dtype) for k, v in data.items() if isinstance(v, torch.Tensor)}
                 model_kwargs = dict(encoder_hidden_states=cond, attention_mask=attn_mask,
@@ -968,6 +974,7 @@ if __name__ == "__main__":
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--sp_size", type=int, default=1, help="For sequence parallel")
     parser.add_argument("--train_sp_batch_size", type=int, default=1, help="Batch size for sequence parallel training")
+    parser.add_argument("--crop", type=str)
 
     args = parser.parse_args()
     main(args)

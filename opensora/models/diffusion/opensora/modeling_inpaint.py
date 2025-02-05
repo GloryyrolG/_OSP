@@ -12,7 +12,9 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNormSingle
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 
-from opensora.models.diffusion.opensora.modules import OverlapPatchEmbed3D, OverlapPatchEmbed2D, PatchEmbed2D, BasicTransformerBlock
+from opensora.models.diffusion.opensora.modules import (
+    OverlapPatchEmbed3D, OverlapPatchEmbed2D, PatchEmbed2D, BasicTransformerBlock,
+    zero_module)
 from opensora.utils.utils import to_2tuple
 try:
     import torch_npu
@@ -28,12 +30,9 @@ import numpy as np
 from enum import Enum, auto
 import glob
 
-from opensora.models.diffusion.opensora.modeling_opensora import OpenSoraT2V
+from opensora.models.diffusion.opensora.modeling_opensora import (
+    OpenSoraT2V, ModuleList, CopyTrain, zero_module, ins_with_str)
 
-def zero_module(module):
-    for p in module.parameters():
-        nn.init.zeros_(p)
-    return module
 
 def reconstitute_checkpoint(pretrained_checkpoint, model_state_dict):
     pretrained_keys = set(list(pretrained_checkpoint.keys()))
@@ -82,6 +81,10 @@ class OpenSoraInpaint(OpenSoraT2V):
         downsampler: str = None, 
         use_rope: bool = False,
         use_stable_fp32: bool = False,
+        latent_pose=None,
+        multitask=None,
+        skips=None,
+        mullev=None,
         # inpaint
         vae_scale_factor_t: int = 4,
     ):
@@ -119,11 +122,17 @@ class OpenSoraInpaint(OpenSoraT2V):
             downsampler=downsampler,
             use_rope=use_rope,
             use_stable_fp32=use_stable_fp32,
+            latent_pose=latent_pose,
+            multitask=multitask,
+            skips=skips,
+            mullev=mullev,
         )
 
         self.vae_scale_factor_t = vae_scale_factor_t
         # init masked_video and mask conv_in
         self._init_patched_inputs_for_inpainting()
+
+        self._create_latent_pose()
 
     def _init_patched_inputs_for_inpainting(self):
 
@@ -219,7 +228,7 @@ class OpenSoraInpaint(OpenSoraT2V):
             )
         
         else:
-            self.pos_embed_mask = nn.ModuleList(
+            self.pos_embed_mask = ModuleList(
                 [
                     PatchEmbed2D(
                         num_frames=self.config.sample_size_t,
@@ -236,37 +245,56 @@ class OpenSoraInpaint(OpenSoraT2V):
                     zero_module(nn.Linear(self.inner_dim, self.inner_dim, bias=False)),
                 ]
             )
-            self.pos_embed_masked_video = nn.ModuleList(
-                [
-                    PatchEmbed2D(
-                        num_frames=self.config.sample_size_t,
-                        height=self.config.sample_size[0],
-                        width=self.config.sample_size[1],
-                        patch_size_t=self.config.patch_size_t,
-                        patch_size=self.config.patch_size,
-                        in_channels=self.in_channels,
-                        embed_dim=self.inner_dim,
-                        interpolation_scale=interpolation_scale, 
-                        interpolation_scale_t=interpolation_scale_t,
-                        use_abs_pos=not self.config.use_rope, 
-                    ),
-                    zero_module(nn.Linear(self.inner_dim, self.inner_dim, bias=False)),
-                ]
-            )
+            inskwargs = {}
+            # if self.config.multitask in ['local', 'fuse1']:
+            #     inskwargs['num'] = self.nmodals
+            #     inskwargs.update(intype=[[1, -1], {}], outtype=2)
+            # else:
+            inskwargs['num'] = 1
+            self.pos_embed_masked_video = ins_with_str(f'ModuleList(\
+                [\
+                    PatchEmbed2D(\
+                        num_frames={self.config.sample_size_t},\
+                        height={self.config.sample_size[0]},\
+                        width={self.config.sample_size[1]},\
+                        patch_size_t={self.config.patch_size_t},\
+                        patch_size={self.config.patch_size},\
+                        in_channels={self.in_channels},\
+                        embed_dim={self.inner_dim},\
+                        interpolation_scale={interpolation_scale},\
+                        interpolation_scale_t={interpolation_scale_t},\
+                        use_abs_pos={not self.config.use_rope},\
+                    ),\
+                    zero_module(nn.Linear({self.inner_dim}, {self.inner_dim}, bias={False})),\
+                ]\
+            )', **inskwargs)
 
-    def _operate_on_patched_inputs(self, hidden_states, encoder_hidden_states, timestep, added_cond_kwargs, batch_size, frame, use_image_num, vip_tokens=None):
+    def _operate_on_patched_inputs(self, hidden_states, encoder_hidden_states, timestep, added_cond_kwargs, batch_size, frame, use_image_num, vip_tokens=None,
+                                   **kwargs):
         # inpaint
-        assert hidden_states.shape[1] == 2 * self.config.in_channels + self.vae_scale_factor_t
+        # assert hidden_states.shape[1] % (2 * self.config.in_channels + self.vae_scale_factor_t) == 0
         assert hidden_states.shape[2] > 1, "OpenSoraInpaint only supports video input"
-        in_channels = self.config.in_channels
-        hidden_states, hidden_states_masked_vid, hidden_states_mask = hidden_states[:, :in_channels], hidden_states[:, in_channels: 2 * in_channels], hidden_states[:, 2 * in_channels:]
+        # hidden_states, hidden_states_masked_vid, hidden_states_mask = hidden_states.chunk(3, dim=1)
+        hidden_states_masked_vid, hidden_states_mask = kwargs['latent_masked_video'], kwargs['ds_mask']
 
-        hidden_states_vid, hidden_states_img = self.pos_embed(hidden_states.to(self.dtype), frame)
-        hidden_states_masked_vid, _ = self.pos_embed_masked_video[0](hidden_states_masked_vid.to(self.dtype), frame)
-        hidden_states_masked_vid = self.pos_embed_masked_video[1](hidden_states_masked_vid)
+        if self.multitask == 'emb':
+            hidden_states = rearrange(hidden_states, 'b (m d) t h w -> (m b) d t h w', d=self.in_channels)
 
-        hidden_states_mask, _ = self.pos_embed_mask[0](hidden_states_mask.to(self.dtype), frame)
-        hidden_states_mask = self.pos_embed_mask[1](hidden_states_mask)
+        return_img = frame < hidden_states.shape[2]
+        out = self.pos_embed(hidden_states.to(self.dtype), frame, return_img=return_img)  # 1, 9600, 2304
+        hidden_states_vid, hidden_states_img = (out, None) if not return_img else out
+        
+        hidden_states_masked_vid = self.pos_embed_masked_video(
+            hidden_states_masked_vid[:, : self.in_channels].to(self.dtype), frame, return_img=False)  # all use only RGB!
+        hidden_states_masked_vid = hidden_states_masked_vid.repeat(
+            hidden_states_vid.shape[0] // hidden_states_masked_vid.shape[0], 1, hidden_states_vid.shape[-1] // hidden_states_masked_vid.shape[-1])  # TODO: add diff conds
+
+        # Sharing
+        # hidden_states_mask = rearrange(hidden_states_mask, 'b (m d) t h w -> (m b) d t h w', d=self.in_channels)
+        hidden_states_mask = self.pos_embed_mask(hidden_states_mask[:, : self.in_channels].to(self.dtype), frame, return_img=False)
+        hidden_states_mask = hidden_states_mask.repeat(
+            hidden_states_vid.shape[0] // hidden_states_mask.shape[0], 1, hidden_states_vid.shape[-1] // hidden_states_mask.shape[-1])
+        # hidden_states_mask = rearrange(hidden_states_mask, '(m b) n d -> b n (m d)', b=hidden_states_vid.shape[0])
 
         hidden_states_vid = hidden_states_vid + hidden_states_masked_vid + hidden_states_mask
         
@@ -281,7 +309,17 @@ class OpenSoraInpaint(OpenSoraT2V):
                 )
             timestep, embedded_timestep = self.adaln_single(
                 timestep, added_cond_kwargs, batch_size=batch_size, hidden_dtype=self.dtype
-            )  # b 6d, b d
+            )  # b 6d, b d. 38M params
+
+            if self.multitask == 'emb':
+                mod_class = torch.eye(self.nmodals, device=timestep.device, dtype=timestep.dtype)
+                mod_embedding = torch.cat([torch.sin(mod_class), torch.cos(mod_class)], dim=-1)
+                mod, embedded_mod = self.mod_emb_proj(
+                    mod_embedding
+                )
+                timestep = (timestep[None, :] + mod[:, None]).flatten(end_dim=1)
+                embedded_timestep = (embedded_timestep[None, :] + embedded_mod[:, None]).flatten(end_dim=1)
+
             if hidden_states_vid is None:
                 timestep_img = timestep
                 embedded_timestep_img = embedded_timestep
@@ -293,6 +331,7 @@ class OpenSoraInpaint(OpenSoraT2V):
                     embedded_timestep_img = repeat(embedded_timestep, 'b d -> (b i) d', i=use_image_num).contiguous()
 
         if self.caption_projection is not None:
+            encoder_hidden_states = encoder_hidden_states.repeat(1, use_image_num + 1, 1, 1)  # added
             encoder_hidden_states = self.caption_projection(encoder_hidden_states)  # b, 1+use_image_num, l, d or b, 1, l, d
 
             if hidden_states_vid is None:
@@ -322,16 +361,27 @@ class OpenSoraInpaint(OpenSoraT2V):
             pretrained_checkpoint = torch.load(pretrained_model_path, map_location='cpu')
             if 'model' in pretrained_checkpoint:
                 pretrained_checkpoint = pretrained_checkpoint['model']
-        checkpoint = reconstitute_checkpoint(pretrained_checkpoint, model_state_dict)
+        # checkpoint = reconstitute_checkpoint(pretrained_checkpoint, model_state_dict)
+        checkpoint = pretrained_checkpoint
 
-        if not 'pos_embed_masked_video.0.weight' in checkpoint:
-            checkpoint['pos_embed_masked_video.0.proj.weight'] = checkpoint['pos_embed.proj.weight']
-            checkpoint['pos_embed_masked_video.0.proj.bias'] = checkpoint['pos_embed.proj.bias']
-        if not 'pos_embed_mask.0.proj.weight' in checkpoint and load_mask:
-            checkpoint['pos_embed_mask.0.proj.weight'] = checkpoint['pos_embed.proj.weight']
-            checkpoint['pos_embed_mask.0.proj.bias'] = checkpoint['pos_embed.proj.bias']
+        if True:  # 'ospv120/' in pretrained_model_path:
+            if not 'pos_embed_masked_video.0.proj.weight' in checkpoint:
+                checkpoint['pos_embed_masked_video.0.proj.weight'] = checkpoint['pos_embed.proj.weight']
+                checkpoint['pos_embed_masked_video.0.proj.bias'] = checkpoint['pos_embed.proj.bias']
+            if not 'pos_embed_mask.0.proj.weight' in checkpoint and load_mask:
+                checkpoint['pos_embed_mask.0.proj.weight'] = checkpoint['pos_embed.proj.weight']
+                checkpoint['pos_embed_mask.0.proj.bias'] = checkpoint['pos_embed.proj.bias']
 
         missing_keys, unexpected_keys = self.load_state_dict(checkpoint, strict=False)
+
+        for k in [k for k in missing_keys]:
+            if torch.all(model_state_dict[k] == 0):  # zeroout
+                missing_keys.remove(k)
+            elif k.startswith('rgs'):  # load later
+                missing_keys.remove(k)
+            elif k.startswith('modal_spatial_attn_blks'):
+                missing_keys.remove(k)
+
         print(f'missing_keys {len(missing_keys)} {missing_keys}, unexpected_keys {len(unexpected_keys)}')
         print(f'Successfully load {len(self.state_dict()) - len(missing_keys)}/{len(model_state_dict)} keys from {pretrained_model_path}!')
 
@@ -341,6 +391,38 @@ class OpenSoraInpaint(OpenSoraT2V):
         pretrained_transformer_model_path = pretrained_model_path.get('transformer_model', None)
 
         self.transformer_model_custom_load_state_dict(pretrained_transformer_model_path, load_mask)
+
+
+class OpenSoraInpaintMulTask(OpenSoraInpaint):
+    """ CtrlNet/LoRA-like copy as a whole, somewhat overkill, #TODO: general """
+    def __init__(self, **kwargs):
+        super(OpenSoraInpaintMulTask, self).__init__(**kwargs)
+        other_models = []
+        for _ in range(self.nmodals - 1):
+            model = OpenSoraInpaint(**kwargs)
+            for i in range(1, len(self.transformer_blocks) - 1):
+                model.transformer_blocks[i] = self.transformer_blocks[i]  # sharing
+        self.other_models = nn.ModuleList(other_models)
+
+    def custom_load_state_dict(self, state_dict, load_mask=False):
+        raise NotImplementedError
+        super().custom_load_state_dict(state_dict, load_mask=load_mask)
+        for i, model in enumerate(self.other_models):
+            state_dicti = {f'other_models.{i}.{k}': v for k, v in model.state_dict().items()
+                           if not k.startswith('other_models')}
+            model.load_state_dict(state_dicti)
+
+    def forward(self, *args, **kwargs):
+        """ Special designed for single-path forward. Time for space (Plan B). Sampling slow.
+            #TODO: multi-level (multi-time) feature fusion like CtrlNet
+        """
+        raise NotImplementedError
+        outs = []
+        for mid in kwargs.pop('mids'):
+            model = super() if mid == 0 else self.other_models[mid - 1]
+            outs.append(model.forward(*args, **kwargs))
+        return torch.cat(outs, )
+
 
 def OpenSoraInpaint_S_122(**kwargs):
     return OpenSoraInpaint(num_layers=28, attention_head_dim=96, num_attention_heads=16, patch_size_t=1, patch_size=2,
@@ -355,7 +437,11 @@ def OpenSoraInpaint_L_122(**kwargs):
                        norm_type="ada_norm_single", caption_channels=4096, cross_attention_dim=2048, **kwargs)
 
 def OpenSoraInpaint_ROPE_L_122(**kwargs):
-    return OpenSoraInpaint(num_layers=32, attention_head_dim=96, num_attention_heads=24, patch_size_t=1, patch_size=2,
+    if kwargs.get('multitask', None) == 'global':
+        cls_ = OpenSoraInpaintMulTask
+    else:
+        cls_ = OpenSoraInpaint
+    return cls_(num_layers=32, attention_head_dim=96, num_attention_heads=24, patch_size_t=1, patch_size=2,
                        norm_type="ada_norm_single", caption_channels=4096, cross_attention_dim=2304, **kwargs)
 
 OpenSoraInpaint_models = {

@@ -1,8 +1,11 @@
+import copy
 import numpy as np
 import torch
 import random
 import numbers
-from torchvision.transforms import RandomCrop, RandomResizedCrop
+from torchvision.transforms import RandomCrop, RandomResizedCrop, Compose
+from torchvision.transforms import functional as vF
+from opensora.utils.classes_and_palettes import GOLIATH_CLASSES, GOLIATH_PALETTE
 from third_parties.open_animateanyone.DWPose.dwpose_utils.util import draw_bodypose
 
 
@@ -337,6 +340,65 @@ class CenterCropResizeVideo:
         return f"{self.__class__.__name__}(size={self.size}, interpolation_mode={self.interpolation_mode}"
 
 
+def bbox_crop(clip, out_ratio, kp2ds=None, bboxes=None, rescale=1.3):
+    assert isinstance(clip, torch.Tensor)
+    clip = clip.clone()
+    out_ratio = torch.as_tensor(out_ratio)
+    T, C = clip.shape[:2]
+
+    confs = kp2ds[..., :, 2]  # all frames  #TODO: bbox
+    right, top = kp2ds[confs == 1][:, : 2].max(0)[0]
+    left, bottom = kp2ds[confs == 1][:, : 2].min(0)[0]
+    # top, bottom = clip.shape[2] - top, clip.shape[2] - bottom  # orig shape
+
+    center = torch.tensor([(right + left) / 2, (top + bottom) / 2])
+    hw = torch.tensor([abs(bottom - top), right - left])
+    out_hw = rescale * torch.cat([hw, hw.flip(0) / out_ratio.flip(0) * out_ratio]).reshape(2, 2).max(0)[0]
+    top, left = center.flip(0) - out_hw / 2
+    
+    # for t in range(clip.shape[0]):  #TODO: too few kps
+    clip_crop = vF.crop(clip.flatten(end_dim=1), int(top), int(left), int(out_hw[0]), int(out_hw[1]))
+    clip_crop = clip_crop.reshape(T, C, *clip_crop.shape[-2:])
+    kp2ds_crop = kp2ds.clone()
+    kp2ds_crop[..., :2] -= torch.tensor([left, top])
+    kp2ds_crop[kp2ds[..., 2] == 0] = 0
+    return clip_crop, kp2ds_crop
+
+
+class BboxCropResizeVideo(CenterCropResizeVideo):
+    '''
+    First use the short side for cropping length,
+    center crop video, then resize to the specified size
+    '''
+
+    def __init__(
+            self,
+            size,
+            top_crop=False, 
+            interpolation_mode="bilinear",
+    ):
+        super(BboxCropResizeVideo, self).__init__(size, top_crop=top_crop,
+                                                  interpolation_mode=interpolation_mode)
+        self.kwargs = True
+
+    def __call__(self, clip, kwargs=None):
+        """
+        Args:
+            clip (torch.tensor): Video clip to be cropped. Size is (T, C, H, W)
+        Returns:
+            torch.tensor: scale resized / center cropped video clip.
+                size is (T, C, crop_size, crop_size)
+        """
+        # clip_center_crop = center_crop_using_short_edge(clip)
+        # clip_center_crop = center_crop_th_tw(clip, self.size[0], self.size[1], top_crop=self.top_crop)
+        clip_crop, kp2ds_crop = bbox_crop(clip, self.size, kp2ds=kwargs['kp2ds'])
+        # import ipdb;ipdb.set_trace()
+        clip_crop_resize = resize(clip_crop, target_size=self.size,
+                                         interpolation_mode=self.interpolation_mode)
+        kp2ds_crop[..., : 2] = kp2ds_crop[..., : 2] / clip_crop.shape[-1] * self.size[-1]
+        return clip_crop_resize, {'kp2ds': kp2ds_crop}
+
+
 class UCFCenterCropVideo:
     '''
     First scale to the specified size in equal proportion to the short edge,
@@ -548,6 +610,11 @@ class DynamicSampleDuration(object):
 #                'left_knee', 'right_knee',                                   # 14
 #                'left_ankle', 'right_ankle')                                 # 16
 
+# OP:
+# Nose, Neck, RShoulder, RElbow, RWrist, LShoulder, LElbow, LWrist, RHip,  # 8
+# RKnee, RAnkle, LHip, LKnee, LAnkle, REye, LEye, REar, LEar  # 17
+
+
 def get_kpmaps(kp17_2ds, h, w):
     T = kp17_2ds.shape[0]
     kpmaps = np.zeros((T, h, w, 3), dtype=np.uint8)
@@ -572,6 +639,162 @@ def get_kpmaps(kp17_2ds, h, w):
 
         kpmaps[t] = draw_bodypose(kpmaps[t], norm_kp18_2ds[t], subset)
     return torch.from_numpy(kpmaps).permute(0, 3, 1, 2)
+
+
+def get_dps(pred_sem_seg):
+    classes = GOLIATH_CLASSES
+    palette = GOLIATH_PALETTE
+    num_classes = len(classes)
+    sem_seg = pred_sem_seg
+    ids = np.unique(sem_seg)[::-1]
+    legal_indices = ids < num_classes
+    ids = ids[legal_indices]
+    labels = np.array(ids, dtype=np.int64)
+
+    colors = [palette[label] for label in labels]
+
+    mask = np.zeros((*pred_sem_seg.shape, 3), dtype=np.uint8)
+    for label, color in zip(labels, colors):
+        mask[sem_seg == label, :] = color
+    return mask
+
+
+def get_dep_normal(depth_map):
+    mask = np.ones(depth_map.shape, dtype='bool')
+    depth_map[~mask] = np.nan
+    depth_foreground = depth_map[mask]  ## value in range [0, 1]
+    processed_depth = np.full((mask.shape[0], mask.shape[1], 3), 100, dtype=np.uint8)
+
+    if len(depth_foreground) > 0:
+        min_val, max_val = np.min(depth_foreground), np.max(depth_foreground)
+        depth_normalized_foreground = 1 - (
+            (depth_foreground - min_val) / (max_val - min_val)
+        )  ## for visualization, foreground is 1 (white), background is 0 (black)
+        depth_normalized_foreground = (depth_normalized_foreground * 255.0).astype(
+            np.uint8
+        )
+
+        depth_colored_foreground = cv2.applyColorMap(
+            depth_normalized_foreground, cv2.COLORMAP_INFERNO
+        )
+        depth_colored_foreground = depth_colored_foreground.reshape(-1, 3)
+        processed_depth[mask] = depth_colored_foreground
+
+    ##---------get surface normal from depth map---------------
+    depth_normalized = np.full((mask.shape[0], mask.shape[1]), np.inf)
+    depth_normalized[mask > 0] = 1 - (
+        (depth_foreground - min_val) / (max_val - min_val)
+    )
+
+    kernel_size = 7
+    grad_x = cv2.Sobel(
+        depth_normalized.astype(np.float32),
+        cv2.CV_32F,
+        1,
+        0,
+        ksize=kernel_size,
+    )
+    grad_y = cv2.Sobel(
+        depth_normalized.astype(np.float32),
+        cv2.CV_32F,
+        0,
+        1,
+        ksize=kernel_size,
+    )
+    z = np.full(grad_x.shape, -1)
+    normals = np.dstack((-grad_x, -grad_y, z))
+
+    # Normalize the normals
+    normals_mag = np.linalg.norm(normals, axis=2, keepdims=True)
+
+    ## background pixels are nan.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        normals_normalized = normals / (
+            normals_mag + 1e-5
+        )  # Add a small epsilon to avoid division by zero
+
+    # Convert normals to a 0-255 scale for visualization
+    normals_normalized = np.nan_to_num(
+        normals_normalized, nan=-1, posinf=-1, neginf=-1
+    )  ## visualize background (nan) as black
+    normal_from_depth = ((normals_normalized + 1) / 2 * 255).astype(np.uint8)
+
+    ## RGB to BGR for cv2
+    normal_from_depth = normal_from_depth[:, :, ::-1]
+
+    # vis_image = np.concatenate([image, processed_depth, normal_from_depth], axis=1)
+    # cv2.imwrite(output_path, vis_image)
+    return processed_depth, normal_from_depth
+
+
+def _msra_generate_target(self, cfg, joints_3d, joints_3d_visible, sigma):
+    """Generate the target heatmap via "MSRA" approach.
+
+    Args:
+        cfg (dict): data config
+        joints_3d: np.ndarray ([num_joints, 3])
+        joints_3d_visible: np.ndarray ([num_joints, 3])
+        sigma: Sigma of heatmap gaussian
+    Returns:
+        tuple: A tuple containing targets.
+
+        - target: Target heatmaps.
+        - target_weight: (1: visible, 0: invisible)
+    """
+    num_joints = len(joints_3d)
+    image_size = cfg['image_size']
+    W, H = cfg['heatmap_size']
+    joint_weights = cfg['joint_weights']
+    use_different_joint_weights = cfg['use_different_joint_weights']
+    assert not use_different_joint_weights
+
+    target_weight = np.zeros((num_joints, 1), dtype=np.float32)
+    target = np.zeros((num_joints, H, W), dtype=np.float32)
+
+    # 3-sigma rule
+    tmp_size = sigma * 3
+
+    if True:  # self.unbiased_encoding:
+        for joint_id in range(num_joints):
+            target_weight[joint_id] = joints_3d_visible[joint_id, 0]
+
+            feat_stride = image_size / [W, H]
+            mu_x = joints_3d[joint_id][0] / feat_stride[0]
+            mu_y = joints_3d[joint_id][1] / feat_stride[1]
+            # Check that any part of the gaussian is in-bounds
+            ul = [mu_x - tmp_size, mu_y - tmp_size]
+            br = [mu_x + tmp_size + 1, mu_y + tmp_size + 1]
+            if ul[0] >= W or ul[1] >= H or br[0] < 0 or br[1] < 0:
+                target_weight[joint_id] = 0
+
+            if target_weight[joint_id] == 0:
+                continue
+
+            x = np.arange(0, W, 1, np.float32)
+            y = np.arange(0, H, 1, np.float32)
+            y = y[:, None]
+
+            if target_weight[joint_id] > 0.5:
+                target[joint_id] = np.exp(-((x - mu_x)**2 +
+                                            (y - mu_y)**2) /
+                                          (2 * sigma**2))
+
+
+class ComposeKwargs(Compose):
+    def __init__(self, transforms):
+        super(ComposeKwargs, self).__init__(transforms)
+    
+    def __call__(self, img, kwargs=None):
+        returns = copy.deepcopy(kwargs)
+        for t in self.transforms:
+            if getattr(t, 'kwargs', False):  # data aug
+                img, returns_t = t(img, kwargs=kwargs)
+                if returns is None:
+                    returns = {}
+                returns.update(returns_t)
+            else:
+                img = t(img)
+        return img, returns
 
 
 if __name__ == '__main__':

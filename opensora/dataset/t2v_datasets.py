@@ -1,3 +1,7 @@
+from argparse import Namespace
+from collections import defaultdict
+import cv2
+import re
 import time
 import traceback
 
@@ -19,14 +23,16 @@ from collections import Counter
 
 import torch
 import torchvision.transforms as transforms
+from torchvision.transforms import functional as F
 from torch.utils.data.dataset import Dataset
 from torch.utils.data import DataLoader, Dataset, get_worker_info
 from tqdm import tqdm
 from PIL import Image
 from accelerate.logging import get_logger
 
-from opensora.dataset.transform import CenterCropResizeVideo, get_kpmaps
+from opensora.dataset.transform import CenterCropResizeVideo, get_kpmaps, get_dps
 from opensora.utils.dataset_utils import DecordInit
+from opensora.utils.imutils import transform, get_transform
 from opensora.utils.utils import text_preprocessing
 logger = get_logger(__name__)
 
@@ -121,21 +127,22 @@ def filter_resolution(h, w, max_h_div_w_ratio=17/16, min_h_div_w_ratio=8 / 16):
 
 class T2V_dataset(Dataset):
     def __init__(self, args, transform, temporal_sample, tokenizer, transform_topcrop):
-        self.data = args.data
+        self.data = getattr(args, 'data', "scripts/train_data/merge_data.txt")
+        # self.nmo = 1 if getattr(args, 'multitask', None) not in ['local', 'fuse1'] else 2
         self.num_frames = args.num_frames
-        self.train_fps = args.train_fps
-        self.use_image_num = args.use_image_num
-        self.use_img_from_vid = args.use_img_from_vid
+        self.train_fps = getattr(args, 'train_fps', 24)
+        self.use_image_num = getattr(args, 'use_image_num', 0)
+        self.use_img_from_vid = getattr(args, 'use_img_from_vid', False)
         self.transform = transform
         self.transform_topcrop = transform_topcrop
         self.temporal_sample = temporal_sample
         self.tokenizer = tokenizer
-        self.model_max_length = args.model_max_length
-        self.cfg = args.cfg
-        self.speed_factor = args.speed_factor
+        self.model_max_length = getattr(args, 'model_max_length', 512)
+        self.cfg = getattr(args, 'cfg', 0)  # 0.1
+        self.speed_factor = getattr(args, 'speed_factor', 1)
         self.max_height = args.max_height
         self.max_width = args.max_width
-        self.drop_short_ratio = args.drop_short_ratio
+        self.drop_short_ratio = getattr(args, 'drop_short_ratio', 1)
         assert self.speed_factor >= 1
         self.v_decoder = DecordInit()
 
@@ -144,13 +151,17 @@ class T2V_dataset(Dataset):
             self.support_Chinese = False
 
         cap_list = self.get_cap_list()
+
+        cap_list = [x for x in cap_list if 'test/' in x['path']
+                    or os.path.isfile(x['path'].replace('video/', 'deps/damv2/'))]
+        print(f"{'>>>' * 10} Test on damv2!")
         
         assert len(cap_list) > 0
         cap_list, self.sample_num_frames = self.define_frame_index(cap_list)
         self.lengths = self.sample_num_frames
 
         n_elements = len(cap_list)
-        dataset_prog.set_cap_list(args.dataloader_num_workers, cap_list, n_elements)
+        dataset_prog.set_cap_list(getattr(args, 'dataloader_num_workers', 10), cap_list, n_elements)
 
         print(f"video length: {len(dataset_prog.cap_list)}", flush=True)
 
@@ -163,13 +174,14 @@ class T2V_dataset(Dataset):
 
     def __getitem__(self, idx):
         try:
-            # idx = 11742
+            # idx = 5596  # 3445  # 11667  # 11742
             # import warnings; warnings.warn(f"{'>>>' * 10} Debug 11742!")
         # if True:
             data = self.get_data(idx)
             return data
         except Exception as e:
             logger.info(f'Error with {idx}: {e}')
+            # raise  # debug
             # 打印异常堆栈
             if idx in dataset_prog.cap_list:
                 logger.info(f"Caught an exception! {dataset_prog.cap_list[idx]}")
@@ -183,6 +195,63 @@ class T2V_dataset(Dataset):
             return self.get_video(idx)
         else:
             return self.get_image(idx)
+    
+    def augm_params(self):
+        """Get augmentation parameters."""
+        self.is_train = True
+        self.options = Namespace(noise_factor=0.4, rot_factor=30,
+                                 scale_factor=0.25, trans_factor=0.1)  #TODO: augm_params 0.25, 0.02
+
+        flip = 0            # flipping
+        pn = np.ones(3)  # per channel pixel-noise
+        rot = 0            # rotation
+        sc = 1            # scaling
+        t = np.zeros(2)
+        if self.is_train:
+            # We flip with probability 1/2
+            if np.random.uniform() <= 0.5:
+                flip = 1
+            
+            # Each channel is multiplied with a number 
+            # in the area [1-opt.noiseFactor,1+opt.noiseFactor]
+            pn = np.random.uniform(1-self.options.noise_factor, 1+self.options.noise_factor, 3)
+            
+            # The rotation is a number in the area [-2*rotFactor, 2*rotFactor]
+            rot = min(2*self.options.rot_factor,
+                    max(-2*self.options.rot_factor, np.random.randn()*self.options.rot_factor))
+            
+            # The scale is multiplied with a number
+            # in the area [1-scaleFactor,1+scaleFactor]
+            sc = min(1+self.options.scale_factor,
+                    max(1-self.options.scale_factor, np.random.randn()*self.options.scale_factor+1))
+            # but it is zero with probability 3/5
+            if np.random.uniform() <= 0.6:
+                rot = 0
+            
+            t[0] = np.clip(np.random.randn(), -1.0, 1.0) * self.options.trans_factor
+            t[1] = np.clip(np.random.randn(), -1.0, 1.0) * self.options.trans_factor
+        
+        flip, rot = False, 0
+        self._augm_params_d = Namespace(flip=flip, pn=pn, rot=rot, sc=sc, t=t)
+
+    def j2d_processing(self, kp, center, scale):
+        """Process gt 2D keypoints and apply all augmentation transforms."""
+        imgres = np.array([self.max_height, self.max_width])
+        center += imgres[:: -1] * self._augm_params_d.t
+        scale *= self._augm_params_d.sc
+        r, f = self._augm_params_d.rot, self._augm_params_d.flip
+
+        trans = get_transform(center, scale, imgres, rot=r)
+        # nparts = kp.shape[0]
+        # for i in range(nparts):
+        kp[...,0:2] = transform(kp[...,0:2]+1, trans)
+        # convert to normalized coordinates
+        # kp[:,:-1] = 2.*kp[:,:-1]/constants.IMG_RES - 1.
+        # flip the x coordinates
+        if f:
+             kp = flip_kp(kp)
+        kp = kp.astype('float32')
+        return kp
     
     def tsfm_kp2ds(self, kp2ds, hw):
         kp2ds = kp2ds.clone()
@@ -208,6 +277,8 @@ class T2V_dataset(Dataset):
         kp2ds = torch.tensor([annot_frame_ids.get(idx, zero_l)
                               for idx in sample_frame_ids])  # almost nonzero ratio >= 0.5
         assert torch.all((kp2ds[..., -1] - 0.5).abs() == 0.5)
+        if kp2ds[..., 2].abs().sum() < 17:
+            raise ValueError
         h, w = (dataset_prog.cap_list[idx]['resolution']['height'],
                 dataset_prog.cap_list[idx]['resolution']['width'])  # orig
         hw = torch.tensor([h, w])
@@ -215,6 +286,72 @@ class T2V_dataset(Dataset):
         kp2ds_orig = kp2ds
         return kp2ds_orig
     
+    def get_sapiens_outs(self, idx, sample_from_ids):
+        """ feats, segs, deps, normals, kps """
+        outs = defaultdict(list)
+        vid_pth = dataset_prog.cap_list[idx]['path']
+        H, W = dataset_prog.cap_list[idx]['resolution'].values()
+        use_parts = True
+        for fidx in sample_from_ids:
+            if use_parts:
+                npy_pth = vid_pth.replace('video/', 'segs/sapiens_1b/')[: -4] + f"_{fidx:05d}_seg.npy"
+                if os.path.isfile(npy_pth):
+                    npy = np.load(npy_pth, mmap_mode='r')
+                    bg = npy == 0
+                    # npy = np.tile(npy[..., None], (1, 1, 3)).astype('uint8') * 9
+                    npy = get_dps(npy)
+                # deps, normals are based on parts
+                if not os.path.isfile(npy_pth) or (~bg).sum() < min(480, H / 2) ** 2 * (48 / 64) * 0.1:
+                    outs['parts'].append(np.zeros((H, W, 3), dtype=np.uint8))
+                    bg = np.zeros((H, W), dtype='bool')
+                    outs['deps'].append(np.zeros((H, W, 3), dtype=np.uint8))
+                    outs['normals'].append(np.zeros((H, W, 3), dtype=np.uint8))
+                else:
+                    outs['parts'].append(npy)
+                    png_pth = vid_pth.replace('video/', 'deps/sapiens_2b/')[: -4] + f"_{fidx:05d}.png"
+                    rgb, dep, normal = np.split(cv2.imread(png_pth), 3, axis=1)
+                    dep[bg] = 0
+                    outs['deps'].append(dep)
+                    outs['normals'].append(normal)
+            else:
+                raise NotImplementedError
+                npy_pth = vid_pth.replace('video/', 'deps/sapiens_2b/')[: -4] + f"_{fidx:05d}.npy"
+            
+            # npy_pth = vid_pth.replace('video/', 'feats/sapiens_2b/')[: -4] + f"_{fidx:05d}.npy"
+            # if not os.path.isfile(png_pth):
+            #     outs['feat3s'].append(np.zeros((H, W, 3)))
+            # else:
+            #     npy = np.load(npy_pth, mmap_mode='r')  # 1920, 64, 64
+            #     npy = F.resize(torch.from_numpy(npy), (W, H)).numpy()
+            #     outs['feat3s'].append(npy)
+        outs = {k: torch.from_numpy(np.stack(v, axis=0)).permute(0, 3, 1, 2) for k, v in outs.items()}
+
+        return outs
+
+    def get_dep_outs(self, idx, sample_from_ids):
+        """ feats, segs, deps, normals, kps """
+        outs = defaultdict(list)
+        vid_pth = dataset_prog.cap_list[idx]['path']
+        H, W = dataset_prog.cap_list[idx]['resolution'].values()
+        deps = []
+        deps_pth = vid_pth.replace('video/', 'deps/damv2/')
+        # print(deps_pth)
+        if os.path.isfile(deps_pth):
+            deps_cap = cv2.VideoCapture(deps_pth)
+            while True:
+                ret, raw_frame = deps_cap.read()
+                if not ret:
+                    break
+                deps.append(raw_frame)
+            deps = np.stack(deps, axis=0)[sample_from_ids]
+        else:
+            deps = np.zeros((len(sample_from_ids), H, W, 3), dtype=np.uint8)
+        outs['deps'] = deps
+        outs['parts'] = np.zeros_like(outs['deps'])
+        outs['normals'] = np.zeros_like(outs['deps'])
+        outs = {k: torch.from_numpy(v).permute(0, 3, 1, 2) for k, v in outs.items()}
+        return outs
+
     def get_video(self, idx):
         # npu_config.print_msg(f"current idx is {idx}")
         # video = random.choice([random_video_noise(65, 3, 336, 448), random_video_noise(65, 3, 1024, 1024), random_video_noise(65, 3, 360, 480)])
@@ -227,11 +364,14 @@ class T2V_dataset(Dataset):
         frame_indice = dataset_prog.cap_list[idx]['sample_frame_index']
         video, sample_frame_ids = self.decord_read(video_path, predefine_num_frames=len(frame_indice))
 
+        kp2ds_orig = self.get_kp2ds(idx, sample_frame_ids)
+
         h, w = video.shape[-2:]
-        assert h / w <= 17 / 16 and h / w >= 8 / 16, f'Only videos with a ratio (h/w) less than 17/16 and more than 8/16 are supported. But video ({video_path}) found ratio is {round(h / w, 2)} with the shape of {video.shape}'
+        # assert h / w <= 17 / 16 and h / w >= 8 / 16, f'Only videos with a ratio (h/w) less than 17/16 and more than 8/16 are supported. But video ({video_path}) found ratio is {round(h / w, 2)} with the shape of {video.shape}'
         t = video.shape[0]
         video_orig = video
-        video = self.transform(video_orig)  # T C H W -> T C H W
+        tsfm_kwargs = vars(Namespace(kp2ds=kp2ds_orig))
+        video, tsfm_returns = self.transform(video_orig, kwargs=tsfm_kwargs)  # T C H W -> T C H W
 
         # video = torch.rand(221, 3, 480, 640)
 
@@ -240,14 +380,15 @@ class T2V_dataset(Dataset):
         if '/motion' in video_path.lower():
             import warnings; warnings.warn(f"{'>>>' * 10} Act as text!")
             text = ' '.join(video_path.split('/')[-1].split('_')[: -1]).replace(' +', ',').lower()
+            text = re.sub(r'\d', '', text).strip()  # rm no
         else:
             text = dataset_prog.cap_list[idx]['cap']
         
         if not isinstance(text, list):
             text = [text]
-        text = [random.choice(text)]
+        raw_text = [random.choice(text)]
 
-        text = text_preprocessing(text, support_Chinese=self.support_Chinese) if random.random() > self.cfg else ""
+        text = text_preprocessing(raw_text, support_Chinese=self.support_Chinese) if random.random() > self.cfg else ""
         text_tokens_and_mask = self.tokenizer(
             text,
             max_length=self.model_max_length,
@@ -261,14 +402,18 @@ class T2V_dataset(Dataset):
         cond_mask = text_tokens_and_mask['attention_mask']
 
         # Other data
-        kp2ds_orig = self.get_kp2ds(idx, sample_frame_ids)
-        h_orig, w_orig = (dataset_prog.cap_list[idx]['resolution']['height'],
-                          dataset_prog.cap_list[idx]['resolution']['width'])  # orig
-        kpmaps_orig = get_kpmaps(kp2ds_orig, h_orig, w_orig)
-        assert kpmaps_orig.shape == video_orig.shape
-        kpmaps = self.transform(kpmaps_orig).transpose(0, 1)
+        # h_orig, w_orig = (dataset_prog.cap_list[idx]['resolution']['height'],
+        #                   dataset_prog.cap_list[idx]['resolution']['width'])  # orig
+        # kpmaps_orig = get_kpmaps(kp2ds_orig, h_orig, w_orig)
+        # assert kpmaps_orig.shape == video_orig.shape
+        # kpmaps = self.transform(kpmaps_orig, kwargs=tsfm_kwargs).transpose(0, 1)
+        # (784, 512) with stickwidth 4
+        kpmaps_crop = get_kpmaps(tsfm_returns['kp2ds'], self.max_height, self.max_width)
+        totensor, norm = self.transform.transforms[0], self.transform.transforms[-1]
+        kpmaps = norm(totensor(kpmaps_crop)).transpose(0, 1)
 
-        return dict(pixel_values=video, input_ids=input_ids, cond_mask=cond_mask, kpmaps=kpmaps, vid_pth=video_path)
+        return dict(pixel_values=video, input_ids=input_ids, cond_mask=cond_mask,
+                    txt=raw_text, kpmaps=kpmaps, vid_pth=video_path)
 
     def get_image(self, idx):
         image_data = dataset_prog.cap_list[idx]  # [{'path': path, 'cap': cap}, ...]

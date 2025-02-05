@@ -1,7 +1,10 @@
+import logging
 import math
+import random
 import sys
 sys.path.append('/mnt/data/rongyu/projects/Open-Sora-Plan/')
 import os
+import numpy as np
 import torch
 import argparse
 import torchvision
@@ -18,6 +21,7 @@ from transformers import T5EncoderModel, MT5EncoderModel, UMT5EncoderModel, Auto
 
 
 from opensora.adaptor.modules import replace_with_fp32_forwards
+from opensora.dataset import t2v_datasets, getdataset
 from opensora.models.causalvideovae import ae_stride_config, ae_channel_config, ae_norm, ae_denorm, CausalVAEModelWrapper
 from opensora.models.diffusion.opensora.modeling_opensora import OpenSoraT2V
 from opensora.models.diffusion.udit.modeling_udit import UDiTT2V
@@ -167,8 +171,22 @@ def main(args):
     # disfigured, poorly drawn face, longbody, lowres, bad anatomy, bad hands, missing fingers, cropped, worst quality, low quality
     # """
 
+    logging.basicConfig(level=logging.INFO)
+    logger = t2v_datasets.logger = logging.getLogger()  # no accelerate
+    args.__dict__.update(max_height=args.height, max_width=args.width, dataset='t2v')
+    dataset = getdataset(args)
+
     video_grids = []
-    for idx, prompt in enumerate(text_prompt):
+    # for idx, prompt in enumerate(text_prompt):
+    text_prompt = []
+    for idx in range(4):
+        didx = random.randint(0, len(dataset) - 1)
+        data = dataset[didx]
+        prompt = data['txt'][0]
+        text_prompt.append(dataset[didx]["vid_pth"])
+        data['kpmaps'] = data['kpmaps'][None].to(dtype=weight_dtype, device=device)
+        logger.info(f"{'>>>' * 10} prompt {prompt}!")
+
         videos = pipeline(positive_prompt.format(prompt),
                           negative_prompt=negative_prompt, 
                           num_frames=args.num_frames,
@@ -181,7 +199,10 @@ def main(args):
                           mask_feature=True,
                           device=args.device, 
                           max_sequence_length=args.max_sequence_length, 
+                          data=data,
                           ).images
+        if pipeline.transformer.latent_pose is not None and pipeline.transformer.latent_pose.startswith('aa'): 
+            videos = (0.6 * videos + 0.4 * ((data['kpmaps'] + 1) / 2 * 255).permute(0, 2, 3, 4, 1).cpu()).to(torch.uint8)
         try:
             if args.num_frames == 1:
                 ext = 'jpg'
@@ -205,6 +226,9 @@ def main(args):
     else:
         video_grids = save_video_grid(video_grids)
         imageio.mimwrite(os.path.join(args.save_img_path, f'{args.sample_method}_gs{args.guidance_scale}_s{args.num_sampling_steps}.{ext}'), video_grids, fps=args.fps, quality=6)
+    
+    with open(os.path.join(args.save_img_path, 'txts.txt'), 'w') as f:
+        f.write('\n'.join(text_prompt))
 
     print('save path {}'.format(args.save_img_path))
 
@@ -234,6 +258,7 @@ if __name__ == "__main__":
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--model_type', type=str, default="udit", choices=['dit', 'udit', 'latte'])
     parser.add_argument('--save_memory', action='store_true')
+    parser.add_argument('--crop', type=str)
     args = parser.parse_args()
 
     main(args)

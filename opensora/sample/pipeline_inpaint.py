@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import torch.nn.functional as F
 import html
 import inspect
@@ -22,7 +23,7 @@ import torch
 from transformers import T5EncoderModel, T5Tokenizer
 
 from diffusers.models import AutoencoderKL, Transformer2DModel
-from diffusers.schedulers import DPMSolverMultistepScheduler
+from diffusers.schedulers import DPMSolverMultistepScheduler, PNDMScheduler, EulerAncestralDiscreteScheduler
 from diffusers.utils import (
     BACKENDS_MAPPING,
     deprecate,
@@ -153,6 +154,7 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
         )
 
         # self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.transformer.requires_grad_(False)
 
     # Copied from diffusers.pipelines.pixart_alpha.pipeline_pixart_alpha.PixArtAlphaPipeline.encode_prompt
     def encode_prompt(
@@ -542,6 +544,9 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
 
         if latents is None:
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            # if self.transformer.multitask in ['fuse1']:
+            #     latents = latents[:, : self.transformer.in_channels]\
+            #         .repeat(1, latents.shape[1] // self.transformer.in_channels, 1, 1, 1)
         else:
             latents = latents.to(device)
 
@@ -561,7 +566,8 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
         width,
         num_images_per_prompt=1, 
         use_vae_preprocessed_mask=False, 
-        device="cuda"
+        device="cuda",
+        data=None,
     ):
         
         # NOTE inpaint
@@ -579,7 +585,7 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
         else:
             raise ValueError("conditional_images should be a list of torch.Tensor")
 
-        input_video = torch.zeros([3, num_frames, height, width], dtype=self.vae.vae.dtype, device=device)
+        input_video = torch.zeros([conditional_images.shape[0], num_frames, height, width], dtype=self.vae.vae.dtype, device=device)
         input_video[:, conditional_images_indices] = conditional_images.to(input_video.dtype)
 
         print(f"conditional_images_indices: {conditional_images_indices}")
@@ -591,9 +597,18 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
             B, C, T, H, W = input_video.shape
             mask = torch.ones([B, 1, T, H, W], device=device)
             mask[:, :, conditional_images_indices] = 0
-            masked_video = input_video * (mask < 0.5) 
-            masked_video = self.vae.encode(masked_video).to(device)
+            masked_video = input_video * (mask < 0.5)
 
+            masked_video = rearrange(masked_video, 'b (m d) t h w -> (m b) d t h w', d=3) 
+            masked_video = self.vae.encode(masked_video).to(device)
+            masked_video = rearrange(masked_video, '(m b) d t h w -> b (m d) t h w', b=B)
+
+            rgb2gray = torch.tensor(
+                [0.299, 0.587, 0.114], dtype=torch.float32, device=data['deps'].device).reshape(3, 1, 1, 1)
+            mask = torch.cat([
+                data['mask'][:, 0: 1],
+                (data['deps'] * rgb2gray).sum(1, keepdim=True)], dim=1)  # + 1
+            
             mask = rearrange(mask, 'b c t h w -> (b c t) 1 h w')
             latent_size = (height // self.vae.vae_scale_factor[1], width // self.vae.vae_scale_factor[2])
             if num_frames % 2 == 1:
@@ -604,8 +619,10 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
             mask = rearrange(mask, '(b c t) 1 h w -> b c t h w', t=T, b=B)
             mask_first_frame = mask[:, :, 0:1].repeat(1, 1, self.vae.vae_scale_factor[0], 1, 1).contiguous()
             mask = torch.cat([mask_first_frame, mask[:, :, 1:]], dim=2)
-            mask = mask.view(batch_size, self.vae.vae_scale_factor[0], latent_size_t, *latent_size).contiguous()
+            mask = mask.view(batch_size, mask.shape[1], self.vae.vae_scale_factor[0], latent_size_t, *latent_size).contiguous()
+            # mask = mask.repeat(1, masked_video.shape[1] // mask.shape[1], 1, 1, 1)
         else:
+            raise NotImplementedError
             mask = torch.ones_like(input_video, device=device)
             mask[:, :, conditional_images_indices] = 0
             masked_video = input_video * (mask < 0.5) 
@@ -613,7 +630,11 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
 
             mask = self.vae.encode(mask).to(device)
         
-        return mask, masked_video
+        # return mask, masked_video
+        data['ds_mask'] = mask[:, 0]
+        data['ds_deps'] = rearrange(mask[:, 1].flatten(start_dim=1, end_dim=2),
+                                    'b (t d) h w -> b d t h w', t=latent_size_t)
+        data['latent_masked_video'] = masked_video
 
     @torch.no_grad()
     def __call__(
@@ -783,7 +804,7 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
 
         # 5. Prepare latents.
-        latent_channels = self.transformer.config.in_channels
+        latent_channels = self.transformer.config.in_channels * self.transformer.nmodals
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             latent_channels,
@@ -795,6 +816,7 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
             generator,
             latents,
         )
+        noise = latents / self.scheduler.init_noise_sigma
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -805,7 +827,10 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
         # 7. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
-        mask, masked_video = self.prepare_mask_masked_video(
+        data = kwargs.get('data', None)
+        if data is not None:
+            data = copy.deepcopy(data)
+        self.prepare_mask_masked_video(
             conditional_images, 
             conditional_images_indices, 
             num_frames,
@@ -815,12 +840,55 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
             num_images_per_prompt, 
             use_vae_preprocessed_mask,
             device=latents.device,
+            data=data,
         )
+        # assert masked_video.shape == latents.shape
 
+        max_noise_t = len(timesteps) * 0
+        gt_mod_latents = False  # True
+        guid_samp = True  # False
+        guid_samp_niters = 1
+        if gt_mod_latents or guid_samp:  #TODO: merge into prepare
+            print(f"{'>>>' * 10} Using GT mod latents!")
+            # Don't go too deep (at same level), keep the reference img's context
+            mod = 'deps'  # 'deps'
+            video = torch.cat([data['pixel_values'], data[mod]], dim=1)  # full.  kpmaps
+            video = rearrange(video, 'b (m d) t h w -> (m b) d t h w', d=3) 
+            video = self.vae.encode(video).to(device)
+            video = rearrange(video, '(m b) d t h w -> b (m d) t h w', b=batch_size)
+            data[f'latent_{mod}'] = video[:, self.transformer.in_channels:]
+            data['noise'] = noise
+            if gt_mod_latents:
+                max_noise_t = int(len(timesteps) * 0.25)  # 0
+                if isinstance(self.scheduler, PNDMScheduler):
+                    assert max_noise_t == 0
+                    latents = self.scheduler.add_noise(video, noise, timesteps[max_noise_t])  #TODO: PNDM max_noise_t x
+                else:
+                    latents = self.scheduler.add_noise(video, noise, timesteps[max_noise_t][None])  # Euler*Discrete
+        
+        if True:  # if self.transformer.latent_pose.startswith('aa'):
+            if do_classifier_free_guidance:
+                # data['kpmaps'] = torch.cat([data['kpmaps']] * 2)
+                # Conds
+                for k in ['kpmaps', 'latent_masked_video', 'ds_mask', 'latent_deps',
+                          'latent_kpmaps', 'ds_deps']:
+                    if k not in data:
+                        continue
+                    data[k] = torch.cat([data[k]] * 2)
+        
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                latent_model_input = torch.cat([latents, masked_video, mask], dim=1)
-                latent_model_input = torch.cat([latent_model_input] * 2) if do_classifier_free_guidance else latents
+            for i, t in enumerate(timesteps[max_noise_t:]):
+                if gt_mod_latents:
+                    _C = self.transformer.in_channels
+                    #TODO: vs from inversion
+                    if isinstance(self.scheduler, PNDMScheduler):
+                        latents[:, _C:] = self.scheduler.add_noise(video, noise, timesteps[max_noise_t + i])[:, _C:]  # diffusion
+                    else:
+                        latents[:, _C:] = self.scheduler.add_noise(video, noise, timesteps[max_noise_t + i][None])[:, _C:]  # diffusion
+                        # latents[:, : _C] = self.scheduler.add_noise(video, noise, timesteps[max_noise_t + i][None])[:, : _C]
+
+                latent_model_input = latents  # torch.cat([latents, masked_video, mask], dim=1)
+                latent_model_input = torch.cat([latent_model_input] * 2) if do_classifier_free_guidance else latent_model_input
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 current_timestep = t
@@ -846,15 +914,21 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
                 # prepare attention_mask.
                 # b c t h w -> b t h w
                 attention_mask = torch.ones_like(latent_model_input)[:, 0]
+
+                fwd_kwargs = {
+                    'attention_mask': attention_mask, 'encoder_hidden_states': prompt_embeds,
+                    'encoder_attention_mask': prompt_attention_mask, 'timestep': current_timestep,
+                    'added_cond_kwargs': added_cond_kwargs, 'data': data, 'return_dict': False,
+                }
+                if guid_samp and t > 300:
+                    latent_model_input = self._guid_samp_optim(latent_model_input, fwd_kwargs,
+                                                               niters=guid_samp_niters)
+                    latents = latent_model_input[: 1]
+
                 # predict noise model_output
                 noise_pred = self.transformer(
                     latent_model_input,
-                    attention_mask=attention_mask, 
-                    encoder_hidden_states=prompt_embeds,
-                    encoder_attention_mask=prompt_attention_mask,
-                    timestep=current_timestep,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
+                    **fwd_kwargs,
                 )[0]
 
                 # perform guidance
@@ -871,6 +945,11 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
                 # compute previous image: x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
                 # print(f'latents_{i}_{t}', torch.max(latents), torch.min(latents), torch.mean(latents), torch.std(latents))
+
+                if i == len(timesteps) - 1 and self.transformer.multitask == 'rg':
+                    # Init ~ 0 noise. TODO: latents -
+                    latents = torch.cat([latents, *[x[x.shape[0] // 2:] for x in self.transformer._rg_outs.values()]], dim=1)
+
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
@@ -883,6 +962,18 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
             # b t h w c
             image = self.decode_latents(latents)
             image = image[:, :num_frames, :height, :width]
+
+            if self.transformer.multitask == 'rg1':
+                rg_outs = []
+                for x in self.transformer._rg_outs.values():
+                    B, D, T, H, W = x.shape
+                    x = rearrange(x[B // 2:], 'b d t h w -> b (t d) h w')
+                    x = torch.cat([x[:, 0: 1], x[:, D:]], dim=1).reshape(-1, 1, H, W)  # mask
+                    x = F.interpolate(x, size=(height, width), mode='bilinear')
+                    x = x.reshape(B // 2, -1, 1, height, width).repeat(1, 1, 3, 1, 1)
+                    x = ((x / 2.0 + 0.5).clamp(0, 1) * 255).to(dtype=torch.uint8).cpu().permute(0, 1, 3, 4, 2).contiguous()
+                    rg_outs.append(x)
+                image = torch.cat([image, *rg_outs], dim=-1)
         else:
             image = latents
 
@@ -894,10 +985,67 @@ class OpenSoraInpaintPipeline(DiffusionPipeline):
 
         return ImagePipelineOutput(images=image)
 
+    def _guid_samp_optim(self, latents, fwd_kwargs, lr=0.02, niters=1):
+        latents_t = latents[: 1].clone().requires_grad_(True)
+        optimizer_cls = torch.optim.AdamW
+        optimizer = optimizer_cls([latents_t], lr=lr, weight_decay=0.0)  # lr
+        for _ in range(niters):
+            for bidx in range(latents.shape[0]):  #TODO: OOM, acc grad
+                # 1. Null-text inversion, CFG, https://github.com/google/prompt-to-prompt/blob/main/null_text_w_ptp.ipynb
+                # 2. Both uncond & cond, https://github.com/google-research/readout_guidance/issues/11#issuecomment-2458069799
+                # if bidx == 0:
+                #     continue
+                # latents_t = latents[: 1]
+                fwd_kwargs_t = {k: (
+                    v[bidx: bidx + 1] if isinstance(v, torch.Tensor) else v) for k, v in fwd_kwargs.items()}
+                fwd_kwargs_t['data'] = {k: v[bidx: bidx + 1] for k, v in fwd_kwargs['data'].items()}
+                with torch.enable_grad():
+                    noise_pred = self.transformer(  # for both unc & cond
+                        latents_t,
+                        **fwd_kwargs_t
+                    )[0]
+                    
+                    pred_x0 = self.transformer.pred_x0_from_noise(
+                            latents_t, noise_pred, self.scheduler, timestep=fwd_kwargs_t['timestep'].long())
+                    norm = lambda x: x  # (x - x.min()) / (x.max() - x.min() + 1e-6)  # s, t for raw dep
+                    data = fwd_kwargs_t['data']
+                    if self.transformer.multitask in ['rg', 'rg1']:
+                        # CG, Readout Guidance, Universal Guidance
+                        loss = 0
+                        for tsk in self.transformer._rg_outs:
+                            loss += F.mse_loss(norm(self.transformer._rg_outs[tsk]),
+                                               norm(data[tsk].to(dtype=self.transformer.dtype)))
+                    else:
+                        # CFG (generative): 1. z0. #TODO: Pass through the diffusion model, slow!
+                        # Could update the model output noise epsilon -- Universal Guidance
+                        loss = F.mse_loss(
+                            norm(pred_x0[:, self.transformer.in_channels:]), norm(data['latent_deps']))  # _deps
+                        
+                        # 2. zt-1 for fwd diffusion/DDIM inversion
+                        # self.scheduler.add_noise(data['latent_kpmaps'], data['noise'], fwd_kwargs_t['timesteps'][None])
+                        # raise NotImplementedError
+                    
+                    optimizer.zero_grad()
+                    loss.backward()  # why grad is None?
+                    optimizer.step()
+                    # latents_t[:, self.transformer.in_channels:].data = latents[:, self.transformer.in_channels:]
+                    # if fwd_kwargs_t['timesteps'] == 950:
+                    #     print(f"{'>>>' * 10} Only optim RGB!")
+                    print(f"{'>>>' * 10} loss = {loss.item()}")
 
+        return latents_t.requires_grad_(False).repeat(latents.shape[0], 1, 1, 1, 1)
+    
     def decode_latents(self, latents):
         # print(f'before vae decode', torch.max(latents).item(), torch.min(latents).item(), torch.mean(latents).item(), torch.std(latents).item())
-        video = self.vae.decode(latents.to(self.vae.vae.dtype))
+        # latents_ = rearrange(latents, 'b (m d) t h w -> (m b) d t h w', d=self.transformer.in_channels)
+        # video = self.vae.decode(latents_.to(self.vae.vae.dtype))
+        # video = rearrange(video, '(m b) t d h w -> b t (m d) h w', b=latents.shape[0])
+        ae_vae_dec_dtype = self.vae.vae.decoder.conv_in.conv.weight.dtype
+        latents_ = rearrange(latents, 'b (m d) t h w -> m b d t h w', d=self.transformer.in_channels).to(ae_vae_dec_dtype)
+        video = []
+        for m in range(latents_.shape[0]):
+            video.append(self.vae.decode(latents_[m]))
+        video = torch.cat(video, dim=2)
         # print(f'after vae decode', torch.max(video).item(), torch.min(video).item(), torch.mean(video).item(), torch.std(video).item())
         video = ((video / 2.0 + 0.5).clamp(0, 1) * 255).to(dtype=torch.uint8).cpu().permute(0, 1, 3, 4, 2).contiguous() # b t h w c
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16

@@ -738,7 +738,7 @@ class OpenSoraPipeline(DiffusionPipeline):
         data = kwargs.get('data', None)
         if data is not None:
             data = copy.deepcopy(data)
-        if self.transformer.latent_pose == 'aa':
+        if self.transformer.latent_pose.startswith('aa'):
             if do_classifier_free_guidance:
                 data['kpmaps'] = torch.cat([data['kpmaps']] * 2)
 

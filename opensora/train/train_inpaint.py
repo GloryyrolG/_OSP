@@ -7,10 +7,12 @@
 """
 A minimal training script for DiT using PyTorch DDP.
 """
+import sys; sys.path.append('/mnt/data/rongyu/projects/Open-Sora-Plan/')
 import argparse
 import logging
 import math
-import os
+import random
+import os; os.environ['WANDB_API_KEY'] = '8cae2c1555835acf0ad8e21bda421e55ef1074dd'
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -62,12 +64,117 @@ from opensora.models.text_encoder import get_text_enc, get_text_warpper
 from opensora.models.causalvideovae import ae_stride_config, ae_channel_config
 from opensora.models.causalvideovae import ae_norm, ae_denorm
 from opensora.models.diffusion import Diffusion_models, Diffusion_models_class
+from opensora.sample.pipeline_inpaint import OpenSoraInpaintPipeline
+from opensora.sample.sample_inpaint import preprocess_images
 from opensora.utils.dataset_utils import Collate, LengthGroupedSampler
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.24.0")
 logger = get_logger(__name__)
+
+
+@torch.inference_mode()
+def log_validation(args, model, vae, text_encoder, tokenizer, accelerator, weight_dtype,
+                   global_step, ema=False, dataset=None):
+    positive_prompt = "(masterpiece), (best quality), (ultra-detailed), {}. emotional, harmonious, vignette, 4k epic detailed, shot on kodak, 35mm photo, sharp focus, high budget, cinemascope, moody, epic, gorgeous"
+    negative_prompt = """nsfw, lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, 
+                        """
+    validation_prompt = [
+        # "A man is doing a jumpy dance",
+        # "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about.",
+        # "A serene underwater scene featuring a sea turtle swimming through a coral reef. The turtle, with its greenish-brown shell, is the main focus of the video, swimming gracefully towards the right side of the frame. The coral reef, teeming with life, is visible in the background, providing a vibrant and colorful backdrop to the turtle's journey. Several small fish, darting around the turtle, add a sense of movement and dynamism to the scene."
+        ]
+    if 'mt5' in args.text_encoder_name:
+        validation_prompt_cn = [
+            # "一只戴着墨镜在泳池当救生员的猫咪。",
+            # "这是一个宁静的水下场景，一只海龟游过珊瑚礁。海龟带着绿褐色的龟壳，优雅地游向画面右侧，成为视频的焦点。背景中的珊瑚礁生机盎然，为海龟的旅程提供了生动多彩的背景。几条小鱼在海龟周围穿梭，为画面增添了动感和活力。"
+            ]
+        validation_prompt += validation_prompt_cn
+
+    logger.info(f"Running validation....\n")
+    model = accelerator.unwrap_model(model)
+    # scheduler = DPMSolverMultistepScheduler()
+    scheduler = PNDMScheduler()  # EulerAncestralDiscreteScheduler()
+    opensora_pipeline = OpenSoraInpaintPipeline(vae=vae,
+                                                text_encoder=text_encoder,
+                                                tokenizer=tokenizer,
+                                                scheduler=scheduler,
+                                                transformer=model).to(device=accelerator.device)
+
+    videos = []
+    collate = Collate(args)  # leave out for simplicity
+    # for i, (prompt, images) in enumerate(zip(validation_prompt, ['tmp/']))
+    for i in range(1):  # validation_prompt:
+        idx = random.randint(0, len(dataset) - 1)
+        data = dataset[idx]
+        cond_imgs = [data['pixel_values'][:, 0]]  # .chu(3, dim=0)[0]
+        cond_imgs_indices = [0]
+        prompt = data['txt']
+        validation_prompt.append(prompt)  # for log
+
+        data['kpmaps'] = data['kpmaps'][None].to(dtype=weight_dtype, device=accelerator.device)
+        logger.info('Processing the #{} ({}) prompt'.format(idx, prompt))
+        video = opensora_pipeline(
+            conditional_images=cond_imgs,
+            conditional_images_indices=cond_imgs_indices,
+            prompt=positive_prompt.format(prompt),
+            negative_prompt=negative_prompt,
+            num_frames=args.num_frames,
+            height=args.max_height,
+            width=args.max_width,
+            num_inference_steps=args.num_sampling_steps,
+            guidance_scale=args.guidance_scale,
+            # enable_temporal_attentions=True,
+            num_images_per_prompt=1,
+            mask_feature=True,
+            max_sequence_length=args.model_max_length,
+
+            data=data,  # dit fwd
+        ).images
+        video[..., : 3] = (0.6 * video[..., : 3] + 0.4 * ((data['kpmaps'] + 1) / 2 * 255).permute(0, 2, 3, 4, 1).cpu()).to(torch.uint8)
+        if video.shape[-1] % 2 != 0:
+            video = torch.cat([video, torch.zeros_like(video[..., : 3])], dim=-1)
+        video = rearrange(video, 'b t h w (m n d) -> b t (m h) (n w) d', m=2, d=3)
+        videos.append(video[0])
+    # import ipdb;ipdb.set_trace()
+    gc.collect()
+    torch.cuda.empty_cache()
+    videos = torch.stack(videos).numpy()
+    videos = rearrange(videos, 'b t h w c -> b t c h w')
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            if videos.shape[1] == 1:
+                assert args.num_frames == 1
+                images = rearrange(videos, 'b 1 c h w -> (b 1) h w c')
+                np_images = np.stack([np.asarray(img) for img in images])
+                tracker.writer.add_images(f"{'ema_' if ema else ''}validation", np_images, global_step, dataformats="NHWC")
+            else:
+                np_videos = np.stack([np.asarray(vid) for vid in videos])
+                tracker.writer.add_video(f"{'ema_' if ema else ''}validation", np_videos, global_step, fps=24)
+        if tracker.name == "wandb":
+            import wandb
+            if videos.shape[1] == 1:
+                images = rearrange(videos, 'b 1 c h w -> (b 1) h w c')
+                logs = {
+                    f"{'ema_' if ema else ''}validation": [
+                        wandb.Image(image, caption=f"{i}: {prompt}")
+                        for i, (image, prompt) in enumerate(zip(images, validation_prompt))
+                    ]
+                }
+            else:
+                logs = {
+                    f"{'ema_' if ema else ''}validation": [
+                        wandb.Video(video, caption=f"{i}: {prompt}", fps=24)
+                        for i, (video, prompt) in enumerate(zip(videos, validation_prompt))
+                    ]
+                }
+            tracker.log(logs, step=global_step)
+
+    del opensora_pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
+
 
 class ProgressInfo:
     def __init__(self, global_step, train_loss=0.0):
@@ -198,6 +305,10 @@ def main(args):
         use_rope=args.use_rope,
         # model_max_length=args.model_max_length,
         use_stable_fp32=args.enable_stable_fp32,
+        latent_pose=args.latent_pose,
+        multitask=args.multitask,
+        skips=args.skips,
+        mullev=args.mullev,
         **model_kwargs,
     )
     model.gradient_checkpointing = args.gradient_checkpointing
@@ -206,6 +317,19 @@ def main(args):
     pretrained_model_path = dict(transformer_model=pretrained_transformer_model_path)
     if pretrained_transformer_model_path is not None:
         model.custom_load_state_dict(pretrained_model_path)
+    
+        if model.multitask in ['rg', 'rg1']:
+            # Load pt params
+            for tsk, rg in model.rgs.items():
+                for i in range(4):
+                    try:
+                        rg.blks[i].load_state_dict(model.transformer_blocks[-4 + i].state_dict())
+                    except RuntimeError as e:
+                        logger.info(str(e))
+                rg.unpat_out_time.load_state_dict_from_pt(model)
+        elif model.multitask == 'idol' and 'idol' not in pretrained_transformer_model_path:
+            for k, blk in model.modal_spatial_attn_blks.items():
+                blk.load_state_dict_from_pt(model.transformer_blocks[int(k) + 1])
 
     noise_scheduler = DDPMScheduler()
 
@@ -218,6 +342,8 @@ def main(args):
     # Move unet, vae and text_encoder to device and cast to weight_dtype
     # The VAE is in float32 to avoid NaN losses.
     ae.vae.to(accelerator.device, dtype=torch.float32)
+    # with torch.no_grad():
+    #     ae.vae.decode(torch.zeros(1, 4, 8, 60, 80, dtype=torch.float32, device=accelerator.device))
     # ae.vae.to(accelerator.device, dtype=weight_dtype)
     text_enc.to(accelerator.device, dtype=weight_dtype)
 
@@ -273,6 +399,91 @@ def main(args):
         args.learning_rate = (
                 args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
+
+    # model.requires_grad_(False)
+    # model.proj_out[1].requires_grad_(True)
+    # print(f"{'>>>' * 10} Freeze model for debugging!")
+    # model.transformer_blocks[-1][1].requires_grad_(True)
+    
+    init_requires_grad = False
+    if args.train_stage != 'fpft' and model.latent_pose == 'ipi0':
+        model.requires_grad_(False)
+        for bidx in model.pose_attn_bidxs:
+            model.transformer_blocks[bidx].pose_attn.requires_grad_(True)
+    elif model.multitask == 'emb':
+        model.requires_grad_(False)
+        if args.train_stage == 'ft':
+            model.mod_emb_proj.requires_grad_(True)
+            model.scale_shift_table.requires_grad_(True)
+        else:
+            model.mod_emb_proj.embs[1].requires_grad_(True)
+            model.mod_emb_proj.linears[1].requires_grad_(True)
+    elif args.multitask in ['rg', 'rg1']:
+        model.requires_grad_(False)
+        model.rgs.requires_grad_(True)
+    elif args.multitask in ['local', 'fuse1', 'idol']:  # hyperhuman. TODO: idol + emb
+        # if args.train_stage == 'rg':
+            # if model.config.mullev == 'true':
+            # Stage 1
+        model.requires_grad_(False)
+        train_mods = []
+        for j in range(1, len(model.proj_out)): 
+            # Because it is generation, not discrimination, so it cannot be all A feats
+            train_mods.append(model.proj_out[j])  # all A feats & at least 1 B feat, e.g. x
+            train_mods.append(model.pos_embed[j])
+        for i in range(model.nsepblks):
+            blks = model.transformer_blocks
+            for j in range(1, len(blks[-1 - i])):
+                train_mods.append(blks[-1 - i][j])  # main purpose. Tune scale_shift_table
+
+                if args.train_stage == 'rg' and i == model.nsepblks - 1 and getattr(blks[i], 'zeroout', False):  # !
+                    pass
+                else:
+                    train_mods.append(blks[i][j])
+        
+        for m in train_mods:
+            m.requires_grad_(True)
+        model.scale_shift_table.requires_grad_(True)
+
+        if model.multitask == 'idol':
+            for k, blk in model.modal_spatial_attn_blks.items():
+                blk.requires_grad_(True)
+                if args.train_stage == 'rg':
+                    blk.main_zeroout.requires_grad_(False)
+        # else:
+        #     raise NotImplementedError
+    else:
+        init_requires_grad = True
+        
+    if args.train_stage == 'ft':
+        if init_requires_grad:
+            # CtrlNxt > CtrlNet/T2IAdapt/RefNet > LoRA. #TODO: add after blk 0
+            for cond_m in [model.adaln_single]:  # caption_projection, enc_pose
+                cond_m.requires_grad_(False)
+            # pos_embeds, proj_out
+            model.scale_shift_table.requires_grad_(False)
+            for name, para in model.transformer_blocks.named_parameters():
+                if "to_out" not in name:  # incl ff, scale_shift_table
+                    para.requires_grad = False
+        else:
+            if hasattr(model, 'enc_pose'):
+                model.enc_pose.requires_grad_(True)
+            model.caption_projection.requires_grad_(True)
+            # for m in [model.pos_embed, model.pos_embed_masked_video, model.pos_embed_mask, model.proj_out]:
+            #     m.requires_grad_(True)
+            for name, para in model.transformer_blocks.named_parameters():
+                if "to_out" in name:
+                    para.requires_grad = True
+                elif 'scale_shift_table' in name and model.multitask == 'emb':
+                    para.requires_grad = True
+
+    elif args.train_stage == 'fpft':
+        for bidx in range(16):
+            for name, param in model.transformer_blocks[bidx].named_parameters():
+                # if 'to_out' in name:
+                #     param.requires_grad = True
+                # else:
+                param.requires_grad = False
 
     params_to_optimize = list(filter(lambda p: p.requires_grad, model.parameters()))
     # Optimizer creation
@@ -372,6 +583,9 @@ def main(args):
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
+    #TODO: ae accelerator
+    # model.ae_vae_dec = ae.vae.decoder
+    # model.ae_vae_post_quant_conv = ae.vae.post_quant_conv
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
@@ -398,7 +612,8 @@ def main(args):
             "entity": entity,
             "run_name": run_name,
         }
-        accelerator.init_trackers(project_name=project_name, config=vars(args), init_kwargs=init_kwargs)
+        accelerator.init_trackers(project_name='debug' if 'debug' in args.output_dir else 'osp',
+                                  config=vars(args), init_kwargs=init_kwargs)
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -500,21 +715,41 @@ def main(args):
         logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
         progress_bar.set_postfix(**logs)
 
-    def run(model_input, model_kwargs, prof):
+    def run(model_kwargs, prof):
+        debug = False
+        if debug:
+            log_validation(args, model, ae, text_enc.text_enc, train_dataset.tokenizer, accelerator,
+                        weight_dtype, progress_info.global_step, dataset=train_dataset)  # debug
+            # input(f"{'>>>' * 10} Debugging sampling!")
+        
         global start_time
         start_time = time.time()
 
-        try:
-            in_channels = ae_channel_config[args.ae]
-            model_input, masked_x, video_mask = model_input[:, 0:in_channels], model_input[:, in_channels:2 * in_channels], model_input[:, 2 * in_channels:]
-        except:
-            raise ValueError("masked_x and video_mask is None!")
+        # try:
+        #     model_input, masked_x, video_mask = model_input.chu(3, dim=1)
+        # except:
+        #     raise ValueError("masked_x and video_mask is None!")
+        data = model_kwargs['data']
+        if model.multitask in ['local', 'fuse1', 'idol', 'emb']:  # AttributeError: 'dict' object has no attribute 'multitask'
+            ks = ['pixel_values', 'kpmaps']  # 'deps', 'kpmaps' as cond, #TODO: 'parts' logits after det
+        else:
+            ks = ['pixel_values']
+        latent_ks = [f'latent_{k}' for k in ks]
+        model_input = torch.cat([v for k, v in data.items() if k in latent_ks], dim=1)  # enlarges latent
 
-        noise = torch.randn_like(model_input)
+        noise = torch.randn_like(model_input)  #TODO: independent noise
         if args.noise_offset:
             # https://www.crosslabs.org//blog/diffusion-with-offset-noise
             noise += args.noise_offset * torch.randn((model_input.shape[0], model_input.shape[1], 1, 1, 1),
                                                      device=model_input.device)
+        
+        # model_input[:, 4:] = model_input[:, : 4]
+        # masked_x[:, 4:] = masked_x[:, : 4]
+        # noise[:, 4:] = noise[:, : 4]
+        # input(f"{'>>>' * 10} Same branch for debugging!")
+
+        # if model.multitask in ['fuse1']:
+        #     noise = noise[:, : model.in_channels].repeat(1, noise.shape[1] // model.in_channels, 1, 1, 1)  # dim does not change
 
         bsz = model_input.shape[0]
         current_step_frame = model_input.shape[2]
@@ -528,8 +763,12 @@ def main(args):
 
         noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
 
+        # if args.poseaug == 'noise':
+        #     model_kwargs['pose_noise'] = torch.randn_like()
+
         model_pred = model(
-            torch.cat([noisy_model_input, masked_x, video_mask], dim=1),
+            # torch.cat([noisy_model_input, masked_x, video_mask], dim=1),
+            noisy_model_input,
             timesteps,
             **model_kwargs,
         )[0]
@@ -541,6 +780,14 @@ def main(args):
 
         if noise_scheduler.config.prediction_type == "epsilon":
             target = noise
+
+            # if model.multitask == 'fuse1' and model.mullev == 'none':
+            #     target = target.clone()
+            #     ori_model_pred = model_pred.clone()
+            #     # x0 sample loss
+            #     target[:, model.in_channels:] = model_input[:, model.in_channels:]
+            #     model_pred[:, model.in_channels:] = model_pred[:, model.in_channels:]
+        
         elif noise_scheduler.config.prediction_type == "v_prediction":
             target = noise_scheduler.get_velocity(model_input, noise, timesteps)
         elif noise_scheduler.config.prediction_type == "sample":
@@ -582,12 +829,91 @@ def main(args):
             elif noise_scheduler.config.prediction_type == "v_prediction":
                 mse_loss_weights = mse_loss_weights / (snr + 1)
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-            loss = loss.reshape(b, -1)
-            mse_loss_weights = mse_loss_weights.reshape(b, 1)
+            
+            if True:
+                assert mask is None
+                mse_loss_weights_scalar = mse_loss_weights
+                mse_loss_weights = mse_loss_weights * torch.ones_like(loss)  #TODO: conf weight & input
+
+                # 1. wrong, temp downsample
+                # for i in range(mse_loss_weights.shape[0]):
+                #     mse_loss_weights[i, model.in_channels:, kwargs['data']['ds_parts'][i, 0]] = 0.1 * mse_loss_weights_scalar
+                # 2. bruteforce
+                conf_weight = False  #TODO: conf_weight
+                if conf_weight:
+                    if torch.rand([]) < 0.01:
+                        print(f"{'>>>' * 10} Conf weight!")
+                
+                    mse_loss_weights[:, model.in_channels:] = 0
+                # if torch.rand([]) < 0.01:
+                #     print(f"{'>>>' * 10} Only rgb loss!")
+
+                if args.train_stage == 'rg':
+                    mse_loss_weights[:, : model.in_channels] = 0
+                
+            else:
+                loss = loss.reshape(b, -1)
+                mse_loss_weights = mse_loss_weights.reshape(b, 1)
             if mask is not None:
                 loss = (loss * mask * mse_loss_weights).sum() / mask.sum()  # mean loss on unpad patches
             else:
                 loss = (loss * mse_loss_weights).mean()
+        
+            if conf_weight:
+                # from latentman
+                def get_alpha_beta(self, timestep: int, prev_timestep: Optional[int] = None):
+                    alpha_prod_t = self.alphas_cumprod[timestep]
+                    beta_prod_t = 1 - alpha_prod_t
+                    alpha_prod_t_prev = None
+                    if prev_timestep is not None:
+                        raise NotImplementedError
+                        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+                    return alpha_prod_t, beta_prod_t, alpha_prod_t_prev
+                
+                alpha_prod_t, beta_prod_t, _ = get_alpha_beta(noise_scheduler, timesteps)
+                pred_x0 = (noisy_model_input - beta_prod_t ** (0.5) * model_pred) / alpha_prod_t ** (0.5)
+                pred_x0 = pred_x0[:, model.in_channels:]  # other mods
+                pred_x0 = rearrange(pred_x0, 'b (m d) t h w -> (m b) d t h w', d=model.in_channels)
+                ae_vae_dec_dtype = ae.vae.decoder.conv_in.conv.weight.dtype
+                recon = ae.vae.decoder(pred_x0.to(ae_vae_dec_dtype))  # OOM!
+                recon = rearrange(recon, '(m b) d t h w -> b (m d) t h w', b=model_input.shape[0])
+                target_ = torch.cat([model_kwargs['data'][k] for k in ks[1:]], dim=1)
+                fg = (model_kwargs['data']['parts'].abs().sum(dim=1, keepdim=True) > 0).to(target_.dtype)
+                fg[fg == 0] = 0.1
+                loss_conf = (fg * F.mse_loss(recon, target_, reduction='none')).mean()
+                loss = loss + (1 - 1 / len(ks)) * loss_conf
+
+            if model.multitask in ['rg', 'rg1']:  #TODO: mulres for rg
+                ws_loss_rg = 1
+                losses_rg = {}
+                # fg = (data['parts'].abs().sum(dim=1, keepdim=True) > 0).to(target_.dtype)
+                fg = 1
+                for tsk in model._rg_outs:
+                    losses_rg[tsk] = (fg * F.mse_loss(model._rg_outs[tsk], data[tsk], reduction='none')).mean()
+                    
+                    loss = loss + ws_loss_rg * losses_rg[tsk]
+            
+            if model.multitask == 'idol' and False:  # pull loss
+                ws_loss_xattn = 10  #TODO: dep on t, l
+                for bidx in model.modal_spatial_attn_blks:
+                    bidx = int(bidx)
+                    blk = model.transformer_blocks[bidx + 1]
+                    if not hasattr(blk, 'attn2'):  # CopyTrain
+                        xattn_w = torch.cat([branch.attn2.processor.attn_weights for branch in blk], dim=0)
+                    else:
+                        xattn = blk.attn2.processor
+                        xattn_w = xattn.attn_weights
+                    # p2p, idol, hcp
+                    xattn_w_meanh = xattn_w.reshape(-1, b, *xattn_w.shape[1:])  # .mean(2)  # mean heads
+                    xattn_w_normed = xattn_w_meanh
+                    # xattn_w_normed = xattn_w_meanh.softmax(dim=-2)
+                    assert xattn_w_normed.shape[1] == 1
+                    # tokidxs = list(range(xattn_w_normed.shape[-1]))
+                    tokidxs = list(range((data['input_ids'][0, 0] > 1).sum()))
+                    losses_xattn = xattn_w_normed.std(dim=0)[..., tokidxs].mean()  #TODO: std (mse), cos
+                    loss = loss + ws_loss_xattn * losses_xattn
+
+            ######### EndLoss
 
         # Gather the losses across all processes for logging (if we use distributed training).
         avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -604,6 +930,24 @@ def main(args):
 
         if accelerator.sync_gradients:
             sync_gradients_info(loss)
+        
+        if accelerator.is_main_process:
+
+            if progress_info.global_step % args.checkpointing_steps == 0:
+
+                if args.enable_tracker:
+                    # log_validation(args, model, ae, text_enc.text_enc, train_dataset.tokenizer, accelerator,
+                    #                weight_dtype, progress_info.global_step)
+
+                    if args.use_ema and npu_config is None:
+                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                        ema_model.store(model.parameters())
+                        ema_model.copy_to(model.parameters())
+                        log_validation(args, model, ae, text_enc.text_enc, train_dataset.tokenizer,
+                                       accelerator, weight_dtype, progress_info.global_step,
+                                       ema=True, dataset=train_dataset)
+                        # Switch back to the original UNet parameters.
+                        ema_model.restore(model.parameters())
 
         if prof is not None:
             prof.step()
@@ -613,7 +957,13 @@ def main(args):
 
     def train_one_step(step_, data_item_, prof_=None):
         train_loss = 0.0
-        x, attn_mask, input_ids, cond_mask = data_item_
+        # data_item_ = {k: (v.to(device=accelerator.device)
+        #                   if isinstance(v, torch.Tensor) else v)
+        #               for k, v in data_item_.items()}
+        x, attn_mask, input_ids, cond_mask = (data_item_['pixel_values'],
+                                              data_item_['attn_mask'],
+                                              data_item_['input_ids'],
+                                              data_item_['cond_mask'])
         # assert torch.all(attn_mask.bool()), 'must all visible'
         # Sample noise that we'll add to the latents
         # import ipdb;ipdb.set_trace()
@@ -639,27 +989,59 @@ def main(args):
             cond = text_enc(input_ids_, cond_mask_)  # B 1 L D
             cond = cond.reshape(B, N, L, -1)
 
-            def preprocess_x_for_inpaint(x):
+            def preprocess_x_for_inpaint(data):
                 # NOTE vae-styled mask, deprecated
                 if args.use_vae_preprocessed_mask:
                     x, masked_x, mask = x[:, :3], x[:, 3:6], x[:, 6:9]
                     x, masked_x, mask = ae.encode(x), ae.encode(masked_x), ae.encode(mask)
                 else:
-                    x, masked_x, mask = x[:, :3], x[:, 3:6], x[:, 6:7]
-                    x, masked_x = ae.encode(x), ae.encode(masked_x)
+                    # orig_x = x.clone()
+                    # B, C, T, H, W = x.shape
+                    # It seems that operations in batch and channel dimensions are relatively limited
+                    # Sharing: AE, pos_embed_mask, transformer_blocks, norm_out
+                    # stack along batch dim for sharing
+                    # x = rearrange(x, 'b (c m d) t h w -> (m b) (c d) t h w',
+                    #                               c=3, d=3).chu(3, dim=1)  #TODO: input decorator
+                    # x, masked_x = ae.encode(x), ae.encode(masked_x)
+                    # mask = mask[:, 0: 1]
+
+                    st_ks = ['pixel_values', 'masked_video', 'kpmaps', 'parts', 'deps', 'normals']
+                    # x = torch.cat([v for k, v in data.items() if k in st_ks], dim=0)
+                    # x = ae.encode(x)  # OOM!
+                    # data.update(dict(zip([f'latent_{k}' for k in st_ks], x.chunk(len(st_ks), dim=0))))
+                    for st_k in st_ks:
+                        data[f'latent_{st_k}'] = ae.encode(data[st_k].to(ae.vae.dtype))
+
+                    ds_ks = ['mask']  # , 'parts']
+                    # mask = data['mask'][:, 0: 1]
+                    rgb2gray = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32, device=data['deps'].device).reshape(3, 1, 1, 1)
+                    mask = torch.cat([
+                        data['mask'][:, 0: 1],
+                        (data['deps'] * rgb2gray).sum(1, keepdim=True) + 1], dim=1)  # 'parts'
+
                     batch_size, channels, frame, height, width = mask.shape
                     mask = rearrange(mask, 'b c t h w -> (b c t) 1 h w')
                     mask = F.interpolate(mask, size=latent_size, mode='bilinear')
                     mask = rearrange(mask, '(b c t) 1 h w -> b c t h w', t=frame, b=batch_size)
                     mask_first_frame = mask[:, :, 0:1].repeat(1, 1, ae_stride_t, 1, 1).contiguous()
-                    mask = torch.cat([mask_first_frame, mask[:, :, 1:]], dim=2)
-                    mask = mask.view(batch_size, ae_stride_t, latent_size_t, latent_size[0], latent_size[1]).contiguous()
+                    mask = torch.cat([mask_first_frame, mask[:, :, 1:]], dim=2)  #TODO: 4 + 28 = 4 * 8?
+                    mask = mask.view(batch_size, mask.shape[1], ae_stride_t, latent_size_t, latent_size[0], latent_size[1]).contiguous()
+                    
+                    # B 3*C T H W -> (B C T H W) * 3
+                    # x = torch.cat([x, masked_x, mask], dim=1) # (B C T H W) * 3 -> B 3*C T H W
 
-                return x, masked_x, mask
+                    # x = rearrange(x, '(m b) (c d) t h w -> b (c m d) t h w', b=B, c=3)
+                    # not vae latent, & latent_masked_video are conds
+                    # data.update(dict(zip([f'ds_{k}' for k in ds_ks], mask.chunk(len(ds_ks), dim=1))))
+                    data['ds_mask'] = mask[:, 0]
+                    data['ds_deps'] = rearrange(mask[:, 1].flatten(start_dim=1, end_dim=2),
+                                                'b (t d) h w -> b d t h w', t=latent_size_t)  #TODO: not temp ds
+
+                return
 
             # Map input images to latent space + normalize latents
-            x, masked_x, mask = preprocess_x_for_inpaint(x) # B 3*C T H W -> (B C T H W) * 3 
-            x = torch.cat([x, masked_x, mask], dim=1) # (B C T H W) * 3 -> B 3*C T H W
+            # x = preprocess_x_for_inpaint(x)
+            preprocess_x_for_inpaint(data_item_)
 
         current_step_frame = x.shape[2]
         current_step_sp_state = get_sequence_parallel_state()
@@ -684,9 +1066,17 @@ def main(args):
             with accelerator.accumulate(model):
                 assert not torch.any(torch.isnan(x)), 'after vae'
                 x = x.to(weight_dtype)
+
+                # keys = ['pixel_values', 'attn_msk', 'input_ids', 'cond_mask', 'txt', 'kpmaps', 'vid_pth']
+                # data = dict(zip(keys, data_item_))
+                data = data_item_
+                data = {k: (v.to(weight_dtype) if k.startswith('latent') or k.startswith('ds') or k in ['kpmaps'] else v)
+                        for k, v in data.items()}
+
                 model_kwargs = dict(encoder_hidden_states=cond, attention_mask=attn_mask,
-                                    encoder_attention_mask=cond_mask, use_image_num=args.use_image_num,)
-                run(x, model_kwargs, prof_)
+                                    encoder_attention_mask=cond_mask, use_image_num=args.use_image_num,
+                                    data=data)
+                run(model_kwargs, prof_)
 
         set_sequence_parallel_state(current_step_sp_state)  # in case the next step use sp, which need broadcast(timesteps)
 
@@ -871,6 +1261,13 @@ if __name__ == "__main__":
     parser.add_argument("--default_text_ratio", type=float, default=0.1)
     parser.add_argument("--pretrained_transformer_model_path", type=str, default=None)
     parser.add_argument("--use_vae_preprocessed_mask", action="store_true")
+
+    parser.add_argument("--latent_pose", type=str)
+    parser.add_argument("--crop", type=str) 
+    parser.add_argument("--multitask", type=str)
+    parser.add_argument("--skips", type=str)
+    parser.add_argument("--mullev", type=str)
+    parser.add_argument("--train_stage", type=str)
 
     args = parser.parse_args()
     main(args)

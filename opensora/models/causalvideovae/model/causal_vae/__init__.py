@@ -14,7 +14,7 @@ class CausalVAEModelWrapper(nn.Module):
             self.vae = self.vae.ema
     def encode(self, x):  # b c t h w
         # x = self.vae.encode(x).sample()
-        x = self.vae.encode(x).sample().mul_(0.18215)
+        x = self.vae.encode(x).sample().mul_(0.18215)  #TODO: rnd
         return x
     def decode(self, x):
         # x = self.vae.decode(x)

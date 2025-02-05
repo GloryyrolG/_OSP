@@ -1,0 +1,1 @@
+/mnt/data/rongyu/datasets/Motion-X++/,/mnt/data/rongyu/projects/Open-Sora-Plan/datasets/motionxpp/annots.json
